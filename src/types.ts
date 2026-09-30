@@ -8,26 +8,6 @@ export interface Alternativa {
   texto: string;
 }
 
-export interface Formula {
-  nome: string;
-  formula: string;
-}
-
-export interface TabelaQuestao {
-  titulo?: string;
-  cabecalho: string[];
-  linhas: string[][];
-  legenda?: string;
-}
-
-export interface FiguraQuestao {
-  tipo: 'Gráfico' | 'Circuito elétrico' | 'Esquema mecânico' | 'Diagrama óptico' | 'Ondas/Oscilações' | 'Ilustração experimental' | 'Outro';
-  titulo?: string;
-  descricao: string;
-  dadosVisuais?: string[];
-  legenda?: string;
-}
-
 export interface QuestaoFísica {
   id: string;
   numero: string;
@@ -35,9 +15,6 @@ export interface QuestaoFísica {
   tema: 'Mecânica' | 'Eletricidade e Magnetismo' | 'Termologia' | 'Óptica' | 'Ondulatória' | 'Física Moderna';
   subtema: string;
   alternativas: Alternativa[];
-  gabarito: string;
-  resolucao: string;
-  formulas: Formula[];
-  tabela?: TabelaQuestao | null;
-  figura?: FiguraQuestao | null;
+  temFigura: boolean;
+  figura?: any; // For backward compatibility if any
 }

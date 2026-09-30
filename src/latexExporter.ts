@@ -136,11 +136,6 @@ export function questionToLatex(q: QuestaoFísica, options: LatexExportOptions =
   if (options.includeComments) {
     parts.push(`% -------------------------------------------------------------`);
     parts.push(`% ${q.numero} | Tema: ${q.tema} | Subtema: ${q.subtema}`);
-    parts.push(`% Gabarito Oficial: (${q.gabarito})`);
-    if (options.includeResolucao && q.resolucao) {
-      const resLines = q.resolucao.split('\n').map(l => `% [Resolução] ${l}`).join('\n');
-      parts.push(resLines);
-    }
     parts.push(`% -------------------------------------------------------------`);
   }
 
@@ -148,56 +143,17 @@ export function questionToLatex(q: QuestaoFísica, options: LatexExportOptions =
   const enunciadoLatex = formatToLatex(q.enunciado);
   parts.push(`\\questao ${enunciadoLatex}`);
 
-  // Tabela identificada na questão (se houver)
-  if (q.tabela && Array.isArray(q.tabela.cabecalho) && q.tabela.cabecalho.length > 0) {
-    const colCount = q.tabela.cabecalho.length;
-    const colAlign = Array(colCount).fill('c').join('|');
-    const headerCols = (q.tabela.cabecalho || []).map(c => `\\textbf{${formatToLatex(c)}}`).join(' & ');
-    
-    parts.push(`\\begin{table}[htbp]`);
-    parts.push(`  \\centering`);
-    if (q.tabela.titulo) {
-      parts.push(`  \\caption{${formatToLatex(q.tabela.titulo)}}`);
-    }
-    parts.push(`  \\begin{tabular}{|${colAlign}|}`);
-    parts.push(`    \\hline`);
-    parts.push(`    ${headerCols} \\\\`);
-    parts.push(`    \\hline`);
-    if (Array.isArray(q.tabela.linhas) && q.tabela.linhas.length > 0) {
-      for (const row of q.tabela.linhas) {
-        const rowCols = (Array.isArray(row) ? row : [row]).map(cell => formatToLatex(cell)).join(' & ');
-        parts.push(`    ${rowCols} \\\\`);
-      }
-      parts.push(`    \\hline`);
-    }
-    parts.push(`  \\end{tabular}`);
-    if (q.tabela.legenda) {
-      parts.push(`  \\par\\vspace{2pt}\\footnotesize ${formatToLatex(q.tabela.legenda)}`);
-    }
-    parts.push(`\\end{table}`);
-  }
-
-  // Figura ou Gráfico identificado na questão (se houver)
-  if (q.figura) {
-    parts.push(`% [ELEMENTO VISUAL IDENTIFICADO: ${q.figura.tipo.toUpperCase()}]`);
-    if (q.figura.titulo) {
-      parts.push(`% Título: ${q.figura.titulo}`);
-    }
-    parts.push(`% Descrição detalhada do elemento visual para referência do professor:`);
-    parts.push(`% ${q.figura.descricao.replace(/\n/g, '\n% ')}`);
-    if (q.figura.dadosVisuais && q.figura.dadosVisuais.length > 0) {
-      parts.push(`% Dados extraídos da imagem: ${q.figura.dadosVisuais.join(' | ')}`);
-    }
-    
+  // Se a questão possui figura (ou se for uma questão antiga com o objeto figura)
+  const temAlgumaFigura = q.temFigura || !!q.figura;
+  if (temAlgumaFigura) {
     const numMatch = q.numero.match(/\d+/);
     const numStr = numMatch ? numMatch[0] : 'xx';
     const filename = `figura_questao_${numStr}.png`;
     
     parts.push(`\\begin{figure}[htbp]`);
     parts.push(`  \\centering`);
-    parts.push(`  % Inserção ativa de imagem (substitua pelo arquivo correspondente '${filename}'):`);
+    parts.push(`  % Inserção de imagem correspondente a esta questão:`);
     parts.push(`  \\includegraphics[width=0.65\\linewidth]{${filename}}`);
-    parts.push(`  \\caption{${formatToLatex(q.figura.titulo || q.figura.descricao.slice(0, 80))}}`);
     parts.push(`\\end{figure}`);
   }
 
@@ -308,4 +264,41 @@ export async function downloadAllThemesZip(
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/**
+ * Gera um único arquivo .tex contendo todas as questões agrupadas e ordenadas por seus respectivos temas.
+ */
+export function generateConsolidatedLatexFile(
+  questoes: QuestaoFísica[],
+  options: LatexExportOptions = { includeComments: true }
+): string {
+  const header = [
+    `% =============================================================`,
+    `% LISTA COMPLETA DE QUESTÕES DE FÍSICA DO ENEM`,
+    `% Total de questões: ${questoes.length}`,
+    `% Gerado automaticamente pelo EnemFísica`,
+    `% =============================================================\n`
+  ].join('\n');
+
+  // Group by theme
+  const agrupado: Record<string, QuestaoFísica[]> = {};
+  for (const q of questoes) {
+    const tema = q.tema || 'Geral';
+    if (!agrupado[tema]) {
+      agrupado[tema] = [];
+    }
+    agrupado[tema].push(q);
+  }
+
+  const sections: string[] = [];
+  for (const [tema, items] of Object.entries(agrupado)) {
+    sections.push(`% -------------------------------------------------------------`);
+    sections.push(`% SEÇÃO: ${tema.toUpperCase()} (${items.length} questões)`);
+    sections.push(`% -------------------------------------------------------------`);
+    const questoesDoTema = items.map(q => questionToLatex(q, options)).join('\n\n');
+    sections.push(questoesDoTema);
+  }
+
+  return `${header}\n${sections.join('\n\n')}\n`;
 }

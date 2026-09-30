@@ -11,8 +11,38 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
+import { PDFDocument } from 'pdf-lib';
+import { PDFParse } from 'pdf-parse';
 
 dotenv.config();
+
+// Helper to extract text from a PDF page-by-page safely using the modern PDFParse class API
+async function getPdfPagesText(fileBuffer: Buffer): Promise<string[]> {
+  const parser = new PDFParse({ data: fileBuffer });
+  try {
+    const result = await parser.getText();
+    // Sort pages by page number (1-based index) ascending
+    const sortedPages = [...result.pages].sort((a, b) => a.num - b.num);
+    const orderedPages: string[] = sortedPages.map(p => p.text);
+    return orderedPages;
+  } finally {
+    await parser.destroy();
+  }
+}
+
+// Helper to extract specific page indexes and output a new PDF Buffer
+async function extractSpecificPages(srcPdfBuffer: Buffer, pageIndexes: number[]): Promise<Buffer> {
+  const srcDoc = await PDFDocument.load(srcPdfBuffer);
+  const destDoc = await PDFDocument.create();
+  
+  const sortedIndexes = [...pageIndexes].sort((a, b) => a - b);
+  
+  const copiedPages = await destDoc.copyPages(srcDoc, sortedIndexes);
+  copiedPages.forEach((page) => destDoc.addPage(page));
+  
+  const pdfBytes = await destDoc.save();
+  return Buffer.from(pdfBytes);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,9 +50,17 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// Configure multer for file uploads
+// Configure multer disk storage to preserve the file extension
+const storage = multer.diskStorage({
+  destination: '/tmp/',
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + '.pdf');
+  }
+});
+
 const upload = multer({
-  dest: '/tmp/',
+  storage: storage,
   limits: {
     fileSize: 45 * 1024 * 1024, // 45 MB limit
   }
@@ -55,11 +93,10 @@ const ai = new GoogleGenAI({
 
 // Priority list of models to gracefully fallback if high-demand (503), quota (429) or connection resets occur
 const CANDIDATE_MODELS = [
-  'gemini-3-flash-preview',
-  'gemini-3.6-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-3.5-flash',
-  'gemini-3.8-flash'
+  'gemini-3.1-flash-lite',
+  'gemini-flash-latest',
+  'gemini-3.8-flash',
+  'gemini-3.5-flash'
 ];
 
 /// Helper to execute Gemini calls with automatic exponential backoff for transient 503/high-demand errors,
@@ -150,6 +187,7 @@ app.post('/api/classify', upload.single('pdfFile'), async (req, res) => {
   }
 
   let uploadedRemoteFile: any = null;
+  let splitTempFilePath: string | null = null;
 
   try {
     const finalPrompt = `Você é um professor de física experiente, especializado no ENEM. 
@@ -176,6 +214,50 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
   }
 ]`;
 
+    // Read full PDF buffer
+    const fullPdfBuffer = await fs.promises.readFile(file.path);
+
+    // Local Search & Precise Page Selection Optimization
+    const requestedNumbers = examText.split(',').map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => !isNaN(n));
+    let finalPdfPath = file.path;
+    let isSplitUsed = false;
+
+    if (requestedNumbers.length > 0) {
+      try {
+        console.log('[Local Optimization] Analisando texto das páginas do PDF localmente...');
+        const orderedPages = await getPdfPagesText(fullPdfBuffer);
+        const pageIndexesToExtract = new Set<number>();
+
+        for (const reqNum of requestedNumbers) {
+          const regex = new RegExp(`QUESTÃO\\s+${reqNum}\\b|Questão\\s+${reqNum}\\b`, 'i');
+          for (let i = 0; i < orderedPages.length; i++) {
+            if (regex.test(orderedPages[i])) {
+              pageIndexesToExtract.add(i);
+              // Include the next page as well, in case the question flows to the next page!
+              if (i + 1 < orderedPages.length) {
+                pageIndexesToExtract.add(i + 1);
+              }
+            }
+          }
+        }
+
+        if (pageIndexesToExtract.size > 0) {
+          const indexesArray = Array.from(pageIndexesToExtract);
+          console.log(`[Local Optimization] Questões localizadas nas páginas (1-indexed): ${indexesArray.map(p => p + 1).join(', ')}. Extraindo apenas estas páginas...`);
+          const splitPdfBuffer = await extractSpecificPages(fullPdfBuffer, indexesArray);
+          
+          splitTempFilePath = path.join('/tmp', `split_${Date.now()}_${Math.random().toString(36).slice(2)}.pdf`);
+          await fs.promises.writeFile(splitTempFilePath, splitPdfBuffer);
+          finalPdfPath = splitTempFilePath;
+          isSplitUsed = true;
+        } else {
+          console.log('[Local Optimization] Nenhuma página correspondente foi localizada pelo texto. Utilizando o PDF completo como fallback seguro.');
+        }
+      } catch (splitErr) {
+        console.warn('[Local Optimization] Falha ao tentar dividir o PDF localmente, utilizando o PDF completo como fallback seguro:', splitErr);
+      }
+    }
+
     const contents: any[] = [];
     
     // Use Gemini Files API for reliable upload of dense PDF documents.
@@ -183,9 +265,9 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
     let useFilesApi = false;
     try {
       uploadedRemoteFile = await ai.files.upload({
-        file: file.path,
+        file: finalPdfPath,
         config: {
-          mimeType: file.mimetype || "application/pdf"
+          mimeType: "application/pdf"
         }
       });
 
@@ -194,7 +276,7 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
         contents.push({
           fileData: {
             fileUri: uploadedRemoteFile.uri,
-            mimeType: uploadedRemoteFile.mimeType || file.mimetype || "application/pdf"
+            mimeType: uploadedRemoteFile.mimeType || "application/pdf"
           }
         });
       }
@@ -203,10 +285,10 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
     }
 
     if (!useFilesApi) {
-      const fileBuffer = await fs.promises.readFile(file.path);
+      const fileBuffer = await fs.promises.readFile(finalPdfPath);
       contents.push({
         inlineData: {
-          mimeType: file.mimetype || "application/pdf",
+          mimeType: "application/pdf",
           data: fileBuffer.toString('base64')
         }
       });
@@ -325,9 +407,13 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
     }
     res.status(500).json({ error: error?.message || 'Erro ao classificar a prova com o Gemini.' });
   } finally {
-    // Clean up local temp file
+    // Clean up local original temp file
     if (file && file.path) {
       fs.promises.unlink(file.path).catch(() => {});
+    }
+    // Clean up local split temp file
+    if (splitTempFilePath) {
+      fs.promises.unlink(splitTempFilePath).catch(() => {});
     }
     // Clean up remote Gemini Files API storage
     if (uploadedRemoteFile && uploadedRemoteFile.name) {

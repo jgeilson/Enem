@@ -189,6 +189,82 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPe
   throw lastError;
 }
 
+/// Helper to upload files to the Gemini Files API with automatic exponential backoff for transient errors
+async function uploadFileWithRetry(aiClient: any, filePath: string, maxRetries = 3): Promise<any> {
+  let lastError: any = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[Gemini Files API] Fazendo upload do arquivo (Tentativa ${attempt}/${maxRetries})...`);
+      const file = await aiClient.files.upload({
+        file: filePath,
+        config: {
+          mimeType: "application/pdf"
+        }
+      });
+      if (file && file.uri) {
+        console.log(`[Gemini Files API] Upload concluído com sucesso. URI: ${file.uri}`);
+        return file;
+      }
+      throw new Error("Resposta de upload inválida (URI vazia).");
+    } catch (error: any) {
+      lastError = error;
+      const errorMsg = String(error?.message || '');
+      const errorStr = String(error);
+      const causeCode = String(error?.cause?.code || '');
+
+      const is429 = 
+        error?.status === 429 || 
+        error?.statusCode === 429 || 
+        errorMsg.includes('429') || 
+        errorMsg.includes('Quota exceeded') || 
+        errorMsg.includes('RESOURCE_EXHAUSTED') ||
+        errorStr.includes('429') || 
+        errorStr.includes('RESOURCE_EXHAUSTED');
+
+      const is503 = 
+        error?.status === 503 || 
+        error?.statusCode === 503 || 
+        errorMsg.includes('503') || 
+        errorMsg.includes('high demand') || 
+        errorMsg.includes('UNAVAILABLE') ||
+        errorMsg.includes('temporary') ||
+        errorStr.includes('503') || 
+        errorStr.includes('high demand') || 
+        errorStr.includes('UNAVAILABLE');
+
+      const isNetworkOrReset = 
+        errorMsg.includes('fetch failed') ||
+        errorMsg.includes('ECONNRESET') ||
+        errorMsg.includes('ETIMEDOUT') ||
+        errorMsg.includes('socket') ||
+        errorMsg.includes('hang up') ||
+        errorStr.includes('ECONNRESET') ||
+        errorStr.includes('fetch failed') ||
+        causeCode === 'ECONNRESET' ||
+        causeCode === 'ETIMEDOUT' ||
+        causeCode === 'UND_ERR_SOCKET';
+
+      console.warn(`[Gemini Files API] Falha no upload na tentativa ${attempt}: ${errorMsg || errorStr}`);
+
+      if (is503 || is429 || isNetworkOrReset) {
+        if (attempt < maxRetries) {
+          const baseWaitMs = Math.pow(2.5, attempt) * 1000;
+          const jitter = Math.random() * 1000;
+          const waitTimeMs = baseWaitMs + jitter;
+          console.log(`[Gemini Files API] Erro recobertável detectado durante o upload. Aplicando backoff exponencial: aguardando ${Math.round(waitTimeMs)}ms antes de tentar novamente...`);
+          await new Promise(resolve => setTimeout(resolve, waitTimeMs));
+        }
+      } else {
+        // Non-recoverable error during upload, fail immediately
+        throw error;
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
 // Classify endpoint
 app.post('/api/classify', upload.single('pdfFile'), async (req, res) => {
   const { examText } = req.body;
@@ -394,13 +470,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
     // This prevents ECONNRESET and fetch failed caused by massive inline base64 payloads in JSON bodies.
     let useFilesApi = false;
     try {
-      uploadedRemoteFile = await ai.files.upload({
-        file: finalPdfPath,
-        config: {
-          mimeType: "application/pdf"
-        }
-      });
-
+      uploadedRemoteFile = await uploadFileWithRetry(ai, finalPdfPath);
       if (uploadedRemoteFile && uploadedRemoteFile.uri) {
         useFilesApi = true;
         contents.push({
@@ -411,7 +481,25 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
         });
       }
     } catch (uploadErr) {
-      console.warn('[Files API Fallback] Falha no upload via ai.files, utilizando inlineData:', uploadErr);
+      console.warn('[Gemini Files API] Falha persistente no upload do arquivo após retries:', uploadErr);
+      
+      // Determine if it is safe to fall back to inlineData based on file size
+      let fileSize = 0;
+      try {
+        const stats = await fs.promises.stat(finalPdfPath);
+        fileSize = stats.size;
+      } catch (statErr) {
+        console.warn('[Gemini Files API] Falha ao ler estatísticas de tamanho do arquivo:', statErr);
+      }
+      
+      const MAX_SAFE_INLINE_SIZE = 1.5 * 1024 * 1024; // 1.5MB
+      
+      if (fileSize > 0 && fileSize <= MAX_SAFE_INLINE_SIZE) {
+        console.log(`[Gemini Files API] Tamanho do arquivo (${(fileSize / 1024).toFixed(1)} KB) é menor que 1.5MB. Prosseguindo com fallback seguro de inlineData.`);
+      } else {
+        console.error(`[Gemini Files API] Tamanho do arquivo (${(fileSize / 1024 / 1024).toFixed(2)} MB) é muito grande para envio inline seguro. Propagando erro.`);
+        throw new Error(`Falha ao carregar o arquivo PDF para a API do Gemini. Detalhes: ${uploadErr instanceof Error ? uploadErr.message : uploadErr}`);
+      }
     }
 
     if (!useFilesApi) {

@@ -18,6 +18,7 @@ export interface QuestaoFísica {
   temFigura: boolean;
   figuras?: {
     tipo: string;
+    pagina: number; // 0-indexed page relative to the PDF sent to the AI
     bbox: { x: number; y: number; width: number; height: number };
   }[];
   figuraBase64?: string; // Crop figure as single-page vector PDF Base64 string

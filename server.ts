@@ -304,17 +304,20 @@ DIRETRIZES DE EXTRAÇÃO:
 RECONHECIMENTO DE FIGURAS COM COORDENADAS (BBOX):
 - Se a questão contiver qualquer figura, gráfico, ilustração, circuito ou diagrama que deva ser extraído, defina "temFigura" como true.
 - Além disso, preencha o campo "figuras" identificando a localização exata da figura na página PDF em coordenadas normalizadas (de 0.0 a 1.0) em relação à largura e altura da página.
-- No campo "figuras", defina uma lista contendo objetos com o "tipo" (ex: "grafico", "ilustracao", "circuito", "diagrama") e o objeto "bbox" contendo:
-  - "x": coordenada horizontal inicial (do lado esquerdo para o direito, de 0.0 a 1.0) do canto superior esquerdo da figura.
-  - "y": coordenada vertical inicial (do topo para a base, de 0.0 a 1.0) do canto superior esquerdo da figura.
-  - "width": largura proporcional da figura (de 0.0 a 1.0).
-  - "height": altura proporcional da figura (de 0.0 a 1.0).
+- No campo "figuras", defina uma lista contendo objetos com:
+  - "tipo": (ex: "grafico", "ilustracao", "circuito", "diagrama")
+  - "pagina": o índice numérico da página (começando em 0) no PDF recebido onde essa figura está desenhada. Se a questão começa na página 0 e o seu gráfico está na página 1, informe "pagina": 1.
+  - "bbox": o objeto contendo:
+    - "x": coordenada horizontal inicial (do lado esquerdo para o direito, de 0.0 a 1.0) do canto superior esquerdo da figura.
+    - "y": coordenada vertical inicial (do topo para a base, de 0.0 a 1.0) do canto superior esquerdo da figura.
+    - "width": largura proporcional da figura (de 0.0 a 1.0).
+    - "height": altura proporcional da figura (de 0.0 a 1.0).
 - REQUISITO DE PRECISÃO ABSOLUTA: Seja extremamente rigoroso, milimétrico e cirúrgico ao calcular a bbox. O retângulo deve englobar estritamente a ilustração física e suas legendas imediatas. NÃO inclua textos de enunciado, tabelas de dados ou partes de questões adjacentes (acima ou abaixo). Se o retângulo ficar muito grande ou deslocado, o corte incluirá textos indesejados. Ajuste a coordenada "y" e a "height" para ficarem coladas nas bordas da ilustração.
 
 REPRODUÇÃO DE TABELAS, LISTAS E FÓRMULAS (ESSENCIAL):
 - Se a questão contiver tabelas (dados em linhas e colunas), você DEVE transcrevê-las obrigatoriamente usando o ambiente LaTeX "tabular" (ex: \begin{tabular}{|c|c|} \hline Cabeçalho 1 & Cabeçalho 2 \\ \hline Dado 1 & Dado 2 \\ \hline \end{tabular}) diretamente embutido no texto do campo "enunciado", garantindo que ela compile perfeitamente e fique legível.
 - Se a questão contiver listas de itens, tópicos ou enumerações no corpo do enunciado, você DEVE formatá-las obrigatoriamente usando os ambientes LaTeX nativos "itemize" ou "enumerate" (ex: \begin{itemize} \item Item 1 \item Item 2 \end{itemize}).
-- Escreva todas as fórmulas físicas, variáveis ou números com expoentes usando a notação matemática nativa do LaTeX (ex: $E = m \cdot c^2$, $2 \cdot 10^3\text{ J}$, $5\text{ m/s}$) para que a renderização no arquivo .tex compilado seja profissional e legível.
+- Escreva todas as fórmulas físicas, variables ou números com expoentes usando a notação matemática nativa do LaTeX (ex: $E = m \cdot c^2$, $2 \cdot 10^3\text{ J}$, $5\text{ m/s}$) para que a renderização no arquivo .tex compilado seja profissional e legível.
 
 DIRETRIZES DE CLASSIFICAÇÃO:
 - Classifique cada questão individualmente em uma das 6 temáticas oficiais do ENEM: Mecânica, Eletricidade e Magnetismo, Termologia, Óptica, Ondulatória, Física Moderna. Caso a questão não pertença a nenhuma destas áreas ou não seja identificável, defina o campo "tema" como null.
@@ -335,6 +338,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
     "figuras": [
       {
         "tipo": "grafico",
+        "pagina": 0,
         "bbox": {
           "x": 0.18,
           "y": 0.42,
@@ -354,6 +358,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
     const requestedNumbers = examText.split(',').map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => !isNaN(n));
     let finalPdfPath = file.path;
     let isSplitUsed = false;
+    let indexesArray: number[] = [];
 
     if (requestedNumbers.length > 0) {
       try {
@@ -439,7 +444,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
         }
 
         if (pageIndexesToExtract.size > 0) {
-          const indexesArray = Array.from(pageIndexesToExtract);
+          indexesArray = Array.from(pageIndexesToExtract);
           console.log(`[Local Optimization] Questões localizadas nas páginas (1-indexed): ${indexesArray.map(p => p + 1).join(', ')}. Extraindo apenas estas páginas...`);
           const splitPdfBuffer = await extractSpecificPages(fullPdfBuffer, indexesArray);
           
@@ -549,6 +554,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                   type: Type.OBJECT,
                   properties: {
                     tipo: { type: Type.STRING },
+                    pagina: { type: Type.INTEGER },
                     bbox: {
                       type: Type.OBJECT,
                       properties: {
@@ -560,7 +566,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                       required: ["x", "y", "width", "height"]
                     }
                   },
-                  required: ["tipo", "bbox"]
+                  required: ["tipo", "pagina", "bbox"]
                 }
               }
             },
@@ -655,11 +661,23 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                       normH = normH / 1000.0;
                     }
 
+                    // Determine the exact original page index for this figure
+                    let originalPageIdx = foundPageIdx; // fallback to question start page
+                    if (typeof fig.pagina === 'number' && fig.pagina >= 0) {
+                      if (isSplitUsed && Array.isArray(indexesArray) && fig.pagina < indexesArray.length) {
+                        originalPageIdx = indexesArray[fig.pagina];
+                        console.log(`[Figure Cropper] Mapeamento de página para Questão ${reqNum}: página relativa ${fig.pagina} -> original ${originalPageIdx + 1}`);
+                      } else {
+                        originalPageIdx = fig.pagina;
+                        console.log(`[Figure Cropper] Mapeamento direto de página para Questão ${reqNum}: página original ${originalPageIdx + 1}`);
+                      }
+                    }
+
                     // Create the cropped destination document
                     const croppedDoc = await PDFDocument.create();
                     
                     // Copy a clean, unmutated page from sourcePdfDoc to the destination document
-                    const [copiedPage] = await croppedDoc.copyPages(sourcePdfDoc, [foundPageIdx]);
+                    const [copiedPage] = await croppedDoc.copyPages(sourcePdfDoc, [originalPageIdx]);
                     croppedDoc.addPage(copiedPage);
 
                     const viewBox = copiedPage.getMediaBox();
@@ -687,7 +705,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                       q.figuraBase64 = figBase64;
                     }
                     
-                    console.log(`[Figure Cropper] Sucesso ao cortar figura ${figIdx + 1}/${q.figuras.length} para Questão ${reqNum} na página ${foundPageIdx + 1}`);
+                    console.log(`[Figure Cropper] Sucesso ao cortar figura ${figIdx + 1}/${q.figuras.length} para Questão ${reqNum} na página ${originalPageIdx + 1}`);
                   }
                 }
               }

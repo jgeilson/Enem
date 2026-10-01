@@ -148,12 +148,21 @@ export function questionToLatex(q: QuestaoFísica, options: LatexExportOptions =
   if (temAlgumaFigura) {
     const numMatch = q.numero.match(/\d+/);
     const numStr = numMatch ? numMatch[0] : 'xx';
-    const filename = `figura_questao_${numStr}.pdf`;
     
     parts.push(`\\begin{figure}[htbp]`);
     parts.push(`  \\centering`);
     parts.push(`  % Inserção de imagem correspondente a esta questão:`);
-    parts.push(`  \\includegraphics[width=0.65\\linewidth]{${filename}}`);
+    
+    if (q.figurasBase64 && q.figurasBase64.length > 0) {
+      for (let index = 0; index < q.figurasBase64.length; index++) {
+        const filename = `figura_questao_${numStr}_fig${index + 1}.pdf`;
+        parts.push(`  \\includegraphics[width=0.65\\linewidth]{${filename}}`);
+      }
+    } else {
+      const filename = `figura_questao_${numStr}.pdf`;
+      parts.push(`  \\includegraphics[width=0.65\\linewidth]{${filename}}`);
+    }
+    
     parts.push(`\\end{figure}`);
   }
 
@@ -258,11 +267,19 @@ export async function downloadAllThemesZip(
 
   // Adiciona as figuras cortadas em vetor (.pdf) no ZIP
   for (const q of questoes) {
-    if (q.temFigura && q.figuraBase64) {
+    if (q.temFigura) {
       const numMatch = q.numero.match(/\d+/);
       const numStr = numMatch ? numMatch[0] : q.id;
-      const filename = `figura_questao_${numStr}.pdf`;
-      zip.file(filename, q.figuraBase64, { base64: true });
+      
+      if (q.figurasBase64 && q.figurasBase64.length > 0) {
+        q.figurasBase64.forEach((figBase64, index) => {
+          const filename = `figura_questao_${numStr}_fig${index + 1}.pdf`;
+          zip.file(filename, figBase64, { base64: true });
+        });
+      } else if (q.figuraBase64) {
+        const filename = `figura_questao_${numStr}.pdf`;
+        zip.file(filename, q.figuraBase64, { base64: true });
+      }
     }
   }
 

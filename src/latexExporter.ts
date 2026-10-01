@@ -100,6 +100,22 @@ export function formatToLatex(text: string): string {
   // Evitar duplicações de cifrões caso ocorram ($$...$$)
   res = res.replace(/\${2,}/g, '$');
 
+  // Format tables (\begin{tabular} ... \end{tabular}) to have clean newlines and indentation around them
+  res = res.replace(/\\begin\{tabular\}/g, '\n\n\\begin{tabular}');
+  res = res.replace(/\\end\{tabular\}/g, '\\end{tabular}\n\n');
+
+  // Format list environments (itemize, enumerate) to have clean newlines and indentation
+  res = res.replace(/\\begin\{itemize\}/g, '\n\n\\begin{itemize}');
+  res = res.replace(/\\end\{itemize\}/g, '\\end{itemize}\n\n');
+  res = res.replace(/\\begin\{enumerate\}/g, '\n\n\\begin{enumerate}');
+  res = res.replace(/\\end\{enumerate\}/g, '\\end{enumerate}\n\n');
+
+  // Ensure individual list items start on their own line with standard indentation
+  res = res.replace(/\\item\s+/g, '\n  \\item ');
+
+  // Clean up any potential multiple consecutive empty lines to maintain beautiful spacing
+  res = res.replace(/\n{3,}/g, '\n\n');
+
   return res;
 }
 
@@ -140,8 +156,11 @@ export function questionToLatex(q: QuestaoFísica, options: LatexExportOptions =
   }
 
   // Enunciado
+  const yearMatch = q.numero.match(/20\d{2}/);
+  const year = yearMatch ? yearMatch[0] : '2025';
+
   const enunciadoLatex = formatToLatex(q.enunciado);
-  parts.push(`\\questao ${enunciadoLatex}`);
+  parts.push(`\\questao (${year}) ${enunciadoLatex}`);
 
   // Se a questão possui figura (ou se for uma questão antiga com o objeto figura)
   const temAlgumaFigura = q.temFigura || !!q.figura;
@@ -155,12 +174,12 @@ export function questionToLatex(q: QuestaoFísica, options: LatexExportOptions =
     
     if (q.figurasBase64 && q.figurasBase64.length > 0) {
       for (let index = 0; index < q.figurasBase64.length; index++) {
-        const filename = `figura_questao_${numStr}_fig${index + 1}.pdf`;
-        parts.push(`  \\includegraphics[width=0.65\\linewidth]{${filename}}`);
+        const filename = `figura_questao_${numStr}_fig${index + 1}_${year}.png`;
+        parts.push(`  \\includegraphics[width=0.65\\linewidth]{imagens/${filename}}`);
       }
     } else {
-      const filename = `figura_questao_${numStr}.pdf`;
-      parts.push(`  \\includegraphics[width=0.65\\linewidth]{${filename}}`);
+      const filename = `figura_questao_${numStr}_${year}.png`;
+      parts.push(`  \\includegraphics[width=0.65\\linewidth]{imagens/${filename}}`);
     }
     
     parts.push(`\\end{figure}`);
@@ -252,7 +271,57 @@ export function downloadLatexFile(filename: string, content: string) {
 }
 
 /**
- * Dispara o download de um arquivo ZIP contendo um arquivo .tex para cada tema e os PDFs das figuras vetorizadas.
+ * Converte uma imagem vetorial PDF codificada em base64 para uma imagem PNG em base64 (removendo o cabeçalho data URI)
+ * utilizando o PDF.js do navegador de forma assíncrona.
+ */
+export async function convertPdfBase64ToPngBase64(base64Data: string): Promise<string> {
+  // Ensure pdfjsLib is loaded in the window
+  if (!(window as any).pdfjsLib) {
+    await new Promise<void>((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js';
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error('Falha ao carregar o conversor de PDF para PNG.'));
+      document.head.appendChild(script);
+    });
+  }
+
+  const pdfjsLib = (window as any).pdfjsLib;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+  // Decode base64 bytes
+  const binaryString = window.atob(base64Data);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+
+  const loadingTask = pdfjsLib.getDocument({ data: bytes });
+  const pdfDoc = await loadingTask.promise;
+  const page = await pdfDoc.getPage(1);
+
+  // Render at 3.5x scale for stunning high-definition quality in LaTeX
+  const viewport = page.getViewport({ scale: 3.5 });
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Não foi possível obter o contexto 2D do Canvas.');
+
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+
+  await page.render({
+    canvasContext: context,
+    viewport: viewport
+  }).promise;
+
+  const dataUrl = canvas.toDataURL('image/png');
+  return dataUrl.replace(/^data:image\/png;base64,/, '');
+}
+
+/**
+ * Dispara o download de um arquivo ZIP contendo um arquivo .tex para cada tema e os arquivos das figuras recortadas em PNG.
  */
 export async function downloadAllThemesZip(
   files: Record<string, { tema: string; filename: string; count: number; content: string }>,
@@ -265,20 +334,39 @@ export async function downloadAllThemesZip(
     zip.file(file.filename, file.content);
   }
 
-  // Adiciona as figuras cortadas em vetor (.pdf) no ZIP
+  // Adiciona as figuras cortadas convertidas em formato de imagem (.png) no ZIP dentro da pasta 'imagens/'
   for (const q of questoes) {
     if (q.temFigura) {
       const numMatch = q.numero.match(/\d+/);
       const numStr = numMatch ? numMatch[0] : q.id;
+      const yearMatch = q.numero.match(/20\d{2}/);
+      const year = yearMatch ? yearMatch[0] : '2025';
       
       if (q.figurasBase64 && q.figurasBase64.length > 0) {
-        q.figurasBase64.forEach((figBase64, index) => {
-          const filename = `figura_questao_${numStr}_fig${index + 1}.pdf`;
-          zip.file(filename, figBase64, { base64: true });
-        });
+        for (let index = 0; index < q.figurasBase64.length; index++) {
+          const figBase64 = q.figurasBase64[index];
+          try {
+            console.log(`[ZIP Export] Convertendo figura ${index + 1} da Questão ${numStr} de PDF para PNG...`);
+            const pngBase64 = await convertPdfBase64ToPngBase64(figBase64);
+            const filename = `figura_questao_${numStr}_fig${index + 1}_${year}.png`;
+            zip.file(`imagens/${filename}`, pngBase64, { base64: true });
+          } catch (err) {
+            console.error(`[ZIP Export] Falha na conversão para PNG da figura ${index + 1} da Questão ${numStr}. Salvando como PDF:`, err);
+            const filename = `figura_questao_${numStr}_fig${index + 1}_${year}.pdf`;
+            zip.file(`imagens/${filename}`, figBase64, { base64: true });
+          }
+        }
       } else if (q.figuraBase64) {
-        const filename = `figura_questao_${numStr}.pdf`;
-        zip.file(filename, q.figuraBase64, { base64: true });
+        try {
+          console.log(`[ZIP Export] Convertendo figura única da Questão ${numStr} de PDF para PNG...`);
+          const pngBase64 = await convertPdfBase64ToPngBase64(q.figuraBase64);
+          const filename = `figura_questao_${numStr}_${year}.png`;
+          zip.file(`imagens/${filename}`, pngBase64, { base64: true });
+        } catch (err) {
+          console.error(`[ZIP Export] Falha na conversão para PNG da figura única da Questão ${numStr}. Salvando como PDF:`, err);
+          const filename = `figura_questao_${numStr}_${year}.pdf`;
+          zip.file(`imagens/${filename}`, q.figuraBase64, { base64: true });
+        }
       }
     }
   }

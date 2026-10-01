@@ -680,20 +680,54 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                     const [copiedPage] = await croppedDoc.copyPages(sourcePdfDoc, [originalPageIdx]);
                     croppedDoc.addPage(copiedPage);
 
-                    const viewBox = copiedPage.getMediaBox();
+                    const mediaBox = copiedPage.getMediaBox();
+                    const cropBox = copiedPage.getCropBox() || mediaBox;
+                    const viewBox = cropBox;
 
-                    const cropX = viewBox.x + (normX * viewBox.width);
+                    // Calculate rotation if any
+                    let rotationAngle = 0;
+                    try {
+                      rotationAngle = copiedPage.getRotation().angle || 0;
+                    } catch {}
+
+                    const rawCropX = viewBox.x + (normX * viewBox.width);
                     // Since Gemini's Y coordinate starts from the top of the viewBox, and PDF starts from bottom
-                    const cropY = viewBox.y + viewBox.height - (normY * viewBox.height) - (normH * viewBox.height);
-                    const cropWidth = normW * viewBox.width;
-                    const cropHeight = normH * viewBox.height;
+                    const rawCropY = viewBox.y + viewBox.height - (normY * viewBox.height) - (normH * viewBox.height);
+                    const rawCropWidth = normW * viewBox.width;
+                    const rawCropHeight = normH * viewBox.height;
 
-                    // Shift page content on the copied page so that the cropped region starts at exactly (0, 0)
-                    copiedPage.translateContent(-cropX, -cropY);
+                    // Apply 1cm (28.35 PDF points) margin around the figure on all sides for safe clipping,
+                    // clamping strictly to the boundaries of the page reference box (viewBox) to keep it legal.
+                    const margin = 28.35; 
+                    const cropX = Math.max(viewBox.x, rawCropX - margin);
+                    const cropY = Math.max(viewBox.y, rawCropY - margin);
 
-                    // Set physical and visible boundaries of the copied page to (0, 0, cropWidth, cropHeight)
-                    copiedPage.setMediaBox(0, 0, cropWidth, cropHeight);
-                    copiedPage.setCropBox(0, 0, cropWidth, cropHeight);
+                    // Re-calculate width expanding left by the exact delta and right by 1cm margin
+                    let cropWidth = rawCropWidth + (rawCropX - cropX) + margin;
+                    if (cropX + cropWidth > viewBox.x + viewBox.width) {
+                      cropWidth = viewBox.x + viewBox.width - cropX;
+                    }
+
+                    // Re-calculate height expanding bottom by the exact delta and top by 1cm margin
+                    let cropHeight = rawCropHeight + (rawCropY - cropY) + margin;
+                    if (cropY + cropHeight > viewBox.y + viewBox.height) {
+                      cropHeight = viewBox.y + viewBox.height - cropY;
+                    }
+
+                    console.log(`
+[Figure Diagnostic] Questão ${reqNum} | Figura ${figIdx + 1}/${q.figuras.length}
+Página Original: ${originalPageIdx + 1}
+Rotação da Página: ${rotationAngle}°
+MediaBox: x=${mediaBox.x.toFixed(2)}, y=${mediaBox.y.toFixed(2)}, w=${mediaBox.width.toFixed(2)}, h=${mediaBox.height.toFixed(2)}
+CropBox: x=${cropBox.x.toFixed(2)}, y=${cropBox.y.toFixed(2)}, w=${cropBox.width.toFixed(2)}, h=${cropBox.height.toFixed(2)}
+Gemini BBOX: x=${normX.toFixed(4)}, y=${normY.toFixed(4)}, w=${normW.toFixed(4)}, h=${normH.toFixed(4)}
+Calculado Crop (com margem de 1cm): x=${cropX.toFixed(2)}, y=${cropY.toFixed(2)}, w=${cropWidth.toFixed(2)}, h=${cropHeight.toFixed(2)}
+`);
+
+                    // Directly adjust MediaBox and CropBox to define the cropped visible region,
+                    // without modifying or translating the vector content coordinates.
+                    copiedPage.setMediaBox(cropX, cropY, cropWidth, cropHeight);
+                    copiedPage.setCropBox(cropX, cropY, cropWidth, cropHeight);
 
                     const croppedPdfBytes = await croppedDoc.save();
                     const figBase64 = Buffer.from(croppedPdfBytes).toString('base64');

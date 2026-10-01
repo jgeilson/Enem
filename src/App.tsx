@@ -354,7 +354,12 @@ export default function App() {
       }
     } catch (err: any) {
       console.error(err);
-      setErrorMessage(err?.message || 'Falha na conexão com o servidor de Inteligência Artificial.');
+      const isFailedToFetch = String(err?.message || '').toLowerCase().includes('failed to fetch') || String(err).toLowerCase().includes('failed to fetch');
+      if (isFailedToFetch) {
+        setErrorMessage('A conexão com o servidor oscilou temporariamente ou o arquivo é muito grande. Por favor, tente clicar novamente em "Extrair Questões" para retomar.');
+      } else {
+        setErrorMessage(err?.message || 'Falha na conexão com o servidor de Inteligência Artificial.');
+      }
     } finally {
       setIsClassifying(false);
     }

@@ -148,7 +148,7 @@ export function questionToLatex(q: QuestaoFísica, options: LatexExportOptions =
   if (temAlgumaFigura) {
     const numMatch = q.numero.match(/\d+/);
     const numStr = numMatch ? numMatch[0] : 'xx';
-    const filename = `figura_questao_${numStr}.png`;
+    const filename = `figura_questao_${numStr}.pdf`;
     
     parts.push(`\\begin{figure}[htbp]`);
     parts.push(`  \\centering`);
@@ -243,16 +243,27 @@ export function downloadLatexFile(filename: string, content: string) {
 }
 
 /**
- * Dispara o download de um arquivo ZIP contendo um arquivo .tex para cada tema.
+ * Dispara o download de um arquivo ZIP contendo um arquivo .tex para cada tema e os PDFs das figuras vetorizadas.
  */
 export async function downloadAllThemesZip(
   files: Record<string, { tema: string; filename: string; count: number; content: string }>,
-  zipFilename = 'enem_fisica_latex_por_tema.zip'
+  zipFilename = 'enem_fisica_latex_por_tema.zip',
+  questoes: QuestaoFísica[] = []
 ) {
   const zip = new JSZip();
 
   for (const file of Object.values(files)) {
     zip.file(file.filename, file.content);
+  }
+
+  // Adiciona as figuras cortadas em vetor (.pdf) no ZIP
+  for (const q of questoes) {
+    if (q.temFigura && q.figuraBase64) {
+      const numMatch = q.numero.match(/\d+/);
+      const numStr = numMatch ? numMatch[0] : q.id;
+      const filename = `figura_questao_${numStr}.pdf`;
+      zip.file(filename, q.figuraBase64, { base64: true });
+    }
   }
 
   const blob = await zip.generateAsync({ type: 'blob' });

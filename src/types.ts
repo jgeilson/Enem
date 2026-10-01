@@ -16,5 +16,10 @@ export interface QuestaoFísica {
   subtema: string;
   alternativas: Alternativa[];
   temFigura: boolean;
+  figuras?: {
+    tipo: string;
+    bbox: { x: number; y: number; width: number; height: number };
+  }[];
+  figuraBase64?: string; // Crop figure as single-page vector PDF Base64 string
   figura?: any; // For backward compatibility if any
 }

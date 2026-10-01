@@ -468,7 +468,7 @@ export default function App() {
   const handleDownloadThemeZip = async () => {
     if (selectedQuestionsForExport.length === 0) return;
     const themeFiles = generateAllThemesFiles(selectedQuestionsForExport, { includeComments });
-    await downloadAllThemesZip(themeFiles, 'questoes_enem_fisica_por_tema.zip');
+    await downloadAllThemesZip(themeFiles, 'questoes_enem_fisica_por_tema.zip', selectedQuestionsForExport);
   };
 
   // Theme Configs (Icons & Colors Matching the Educational Guide)
@@ -955,18 +955,40 @@ export default function App() {
 
                           {/* Image Selector toggle switch */}
                           <td className="px-4 py-3.5 text-center">
-                            <button
-                              type="button"
-                              onClick={() => handleToggleHasImage(q.id)}
-                              className={`inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-extrabold tracking-wide uppercase rounded-md border transition-all cursor-pointer ${
-                                q.temFigura
-                                  ? 'bg-amber-50 text-amber-700 border-amber-200'
-                                  : 'bg-slate-100 text-slate-400 border-transparent hover:border-slate-200'
-                              }`}
-                            >
-                              <ImageIcon size={10} className={q.temFigura ? 'text-amber-500' : 'text-slate-400'} />
-                              <span>{q.temFigura ? 'Sim' : 'Não'}</span>
-                            </button>
+                            <div className="flex flex-col items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleToggleHasImage(q.id)}
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-extrabold tracking-wide uppercase rounded-md border transition-all cursor-pointer ${
+                                  q.temFigura
+                                    ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                    : 'bg-slate-100 text-slate-400 border-transparent hover:border-slate-200'
+                                }`}
+                              >
+                                <ImageIcon size={10} className={q.temFigura ? 'text-amber-500' : 'text-slate-400'} />
+                                <span>{q.temFigura ? 'Sim' : 'Não'}</span>
+                              </button>
+
+                              {q.temFigura && q.figuraBase64 && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const numMatch = q.numero.match(/\d+/);
+                                    const numStr = numMatch ? numMatch[0] : q.id;
+                                    const linkSource = `data:application/pdf;base64,${q.figuraBase64}`;
+                                    const downloadLink = document.createElement("a");
+                                    downloadLink.href = linkSource;
+                                    downloadLink.download = `figura_questao_${numStr}.pdf`;
+                                    downloadLink.click();
+                                  }}
+                                  className="inline-flex items-center gap-1 text-[9px] font-bold text-indigo-600 hover:text-indigo-800 transition-colors bg-indigo-50 hover:bg-indigo-100 px-1.5 py-0.5 rounded border border-indigo-100/40 cursor-pointer"
+                                  title="Baixar figura vetorizada (.pdf)"
+                                >
+                                  <FileDown size={10} />
+                                  <span>Baixar Vetor</span>
+                                </button>
+                              )}
+                            </div>
                           </td>
 
                           {/* Actions: Edit, Delete */}

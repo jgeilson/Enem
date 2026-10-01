@@ -199,6 +199,7 @@ app.post('/api/classify', upload.single('pdfFile'), async (req, res) => {
 
   let uploadedRemoteFile: any = null;
   let splitTempFilePath: string | null = null;
+  let orderedPages: string[] = [];
 
   const startTotal = Date.now();
   let startUploadGemini = 0;
@@ -215,7 +216,17 @@ DIRETRIZES DE EXTRAÇÃO:
 - Localize e transcreva EXCLUSIVAMENTE as questões com os números: ${examText}. Ignore todo o restante do documento PDF.
 - Preserve com fidelidade absoluta o enunciado original: transcreva todo o texto integralmente, sem simplificações, sem resumos, mantendo rigorosamente todos os valores numéricos, algarismos significativos (ex: mantenha "0,50 m" exatamente e NUNCA simplifique ou altere para "0,5 m"), notações científicas, fórmulas e unidades de medida exatamente como aparecem no PDF original.
 - Para cada questão, extraia todas as 5 alternativas (A, B, C, D, E), preservando o texto original de cada uma delas com fidelidade total e absoluta.
-- Identifique se a questão possui qualquer figura, tabela, gráfico ou ilustração original associada e defina o campo "temFigura" correspondente (true ou false).
+- Identifique se a questão possui qualquer figura, tabela complexa (representada por imagem), gráfico, diagrama ou ilustração original associada e defina o campo "temFigura" correspondente (true ou false).
+
+RECONHECIMENTO DE FIGURAS COM COORDENADAS (BBOX):
+- Se a questão contiver qualquer figura, gráfico, ilustração, circuito ou diagrama que deva ser extraído, defina "temFigura" como true.
+- Além disso, preencha o campo "figuras" identificando a localização exata da figura na página PDF em coordenadas normalizadas (de 0.0 a 1.0) em relação à largura e altura da página.
+- No campo "figuras", defina uma lista contendo objetos com o "tipo" (ex: "grafico", "ilustracao", "circuito", "diagrama") e o objeto "bbox" contendo:
+  - "x": coordenada horizontal inicial (do lado esquerdo para o direito, de 0.0 a 1.0) do canto superior esquerdo da figura.
+  - "y": coordenada vertical inicial (do topo para a base, de 0.0 a 1.0) do canto superior esquerdo da figura.
+  - "width": largura proporcional da figura (de 0.0 a 1.0).
+  - "height": altura proporcional da figura (de 0.0 a 1.0).
+- Seja extremamente rigoroso e preciso nas coordenadas para garantir que o corte contenha toda a figura e suas legendas perfeitamente.
 
 REPRODUÇÃO DE TABELAS, LISTAS E FÓRMULAS (ESSENCIAL):
 - Se a questão contiver tabelas (dados em linhas e colunas), você DEVE transcrevê-las obrigatoriamente usando o ambiente LaTeX "tabular" (ex: \begin{tabular}{|c|c|} \hline Cabeçalho 1 & Cabeçalho 2 \\ \hline Dado 1 & Dado 2 \\ \hline \end{tabular}) diretamente embutido no texto do campo "enunciado", garantindo que ela compile perfeitamente e fique legível.
@@ -237,7 +248,18 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
     "alternativas": [
       { "letra": "A", "texto": "Texto original transcrito da alternativa..." }
     ],
-    "temFigura": true
+    "temFigura": true,
+    "figuras": [
+      {
+        "tipo": "grafico",
+        "bbox": {
+          "x": 0.18,
+          "y": 0.42,
+          "width": 0.64,
+          "height": 0.25
+        }
+      }
+    ]
   }
 ]`;
 
@@ -252,7 +274,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
 
     if (requestedNumbers.length > 0) {
       try {
-        let orderedPages: string[] = [];
+        orderedPages = [];
         if (pdfPageTextCache.has(pdfHash)) {
           console.log(`[Cache Hit] Utilizando textos das páginas indexados do cache local (Hash: ${pdfHash}).`);
           orderedPages = pdfPageTextCache.get(pdfHash)!;
@@ -369,7 +391,27 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                   required: ["letra", "texto"]
                 }
               },
-              temFigura: { type: Type.BOOLEAN }
+              temFigura: { type: Type.BOOLEAN },
+              figuras: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    tipo: { type: Type.STRING },
+                    bbox: {
+                      type: Type.OBJECT,
+                      properties: {
+                        x: { type: Type.NUMBER },
+                        y: { type: Type.NUMBER },
+                        width: { type: Type.NUMBER },
+                        height: { type: Type.NUMBER }
+                      },
+                      required: ["x", "y", "width", "height"]
+                    }
+                  },
+                  required: ["tipo", "bbox"]
+                }
+              }
             },
             required: ["numero", "enunciado", "subtema", "alternativas", "temFigura"]
           }
@@ -411,6 +453,58 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
         parsedJson = [];
       }
     }
+    // Process each question to crop figures using pdf-lib if figures and bbox are provided
+    for (const q of parsedJson) {
+      if (q.temFigura && Array.isArray(q.figuras) && q.figuras.length > 0) {
+        try {
+          const matchNum = String(q.numero || '').match(/\d+/);
+          const reqNum = matchNum ? parseInt(matchNum[0], 10) : null;
+          
+          if (reqNum) {
+            // Find which page index this question is on (0-indexed)
+            const regex = new RegExp(`QUESTÃO\\s+${reqNum}\\b|Questão\\s+${reqNum}\\b`, 'i');
+            let foundPageIdx = -1;
+            for (let i = 0; i < orderedPages.length; i++) {
+              if (regex.test(orderedPages[i])) {
+                foundPageIdx = i;
+                break;
+              }
+            }
+
+            if (foundPageIdx !== -1) {
+              const fig = q.figuras[0];
+              if (fig && fig.bbox) {
+                const bbox = fig.bbox;
+                const pdfDoc = await PDFDocument.load(fullPdfBuffer);
+                const page = pdfDoc.getPage(foundPageIdx);
+                const { width: pageW, height: pageH } = page.getSize();
+
+                const cropX = bbox.x * pageW;
+                // Since Gemini's Y coordinate starts from the top, and PDF starts from bottom
+                const cropY = pageH - (bbox.y * pageH) - (bbox.height * pageH);
+                const cropWidth = bbox.width * pageW;
+                const cropHeight = bbox.height * pageH;
+
+                // Set bounding box bounds securely
+                page.setMediaBox(cropX, cropY, cropWidth, cropHeight);
+                page.setCropBox(cropX, cropY, cropWidth, cropHeight);
+
+                const croppedDoc = await PDFDocument.create();
+                const [copiedPage] = await croppedDoc.copyPages(pdfDoc, [foundPageIdx]);
+                croppedDoc.addPage(copiedPage);
+
+                const croppedPdfBytes = await croppedDoc.save();
+                q.figuraBase64 = Buffer.from(croppedPdfBytes).toString('base64');
+                console.log(`[Figure Cropper] Sucesso ao cortar figura vetorizada para Questão ${reqNum} na página ${foundPageIdx + 1}`);
+              }
+            }
+          }
+        } catch (cropErr) {
+          console.error('[Figure Cropper] Falha ao cortar a figura da questão:', cropErr);
+        }
+      }
+    }
+
     endParse = Date.now();
 
     res.setHeader('Content-Type', 'application/json');

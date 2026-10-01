@@ -21,5 +21,6 @@ export interface QuestaoFísica {
     bbox: { x: number; y: number; width: number; height: number };
   }[];
   figuraBase64?: string; // Crop figure as single-page vector PDF Base64 string
+  figurasBase64?: string[]; // Multiple cropped figures support!
   figura?: any; // For backward compatibility if any
 }

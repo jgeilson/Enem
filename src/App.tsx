@@ -1039,39 +1039,79 @@ export default function App() {
                                 <span>{q.temFigura ? 'Sim' : 'Não'}</span>
                               </button>
 
-                              {q.temFigura && q.figuraBase64 && (
-                                <div className="flex flex-col gap-1 items-center">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
-                                    disabled={downloadingPngId === q.id}
-                                    className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
-                                    title="Baixar figura recortada (.png)"
-                                  >
-                                    {downloadingPngId === q.id ? (
-                                      <RefreshCw size={10} className="animate-spin text-amber-500" />
-                                    ) : (
-                                      <FileDown size={10} />
-                                    )}
-                                    <span>Baixar PNG</span>
-                                  </button>
-                                  
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      const numMatch = q.numero.match(/\d+/);
-                                      const numStr = numMatch ? numMatch[0] : q.id;
-                                      const linkSource = `data:application/pdf;base64,${q.figuraBase64}`;
-                                      const downloadLink = document.createElement("a");
-                                      downloadLink.href = linkSource;
-                                      downloadLink.download = `figura_questao_${numStr}.pdf`;
-                                      downloadLink.click();
-                                    }}
-                                    className="text-[8px] font-semibold text-slate-400 hover:text-slate-600 transition-colors hover:underline cursor-pointer"
-                                    title="Baixar no formato vetorial original (.pdf)"
-                                  >
-                                    (Baixar PDF Vetorial)
-                                  </button>
+                              {q.temFigura && (
+                                <div className="flex flex-col gap-1.5 items-center">
+                                  {q.figurasBase64 && q.figurasBase64.length > 0 ? (
+                                    q.figurasBase64.map((figBase64, index) => (
+                                      <div key={index} className="flex flex-col gap-0.5 items-center border border-indigo-100/20 p-1.5 rounded-lg bg-indigo-50/20 shadow-2xs">
+                                        <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wide">Fig {index + 1}</span>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDownloadPng(figBase64, `${q.numero}_fig${index + 1}`, `${q.id}_${index}`)}
+                                          disabled={downloadingPngId === `${q.id}_${index}`}
+                                          className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                          title={`Baixar figura ${index + 1} recortada (.png)`}
+                                        >
+                                          {downloadingPngId === `${q.id}_${index}` ? (
+                                            <RefreshCw size={10} className="animate-spin text-amber-500" />
+                                          ) : (
+                                            <FileDown size={10} />
+                                          )}
+                                          <span>PNG</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const numMatch = q.numero.match(/\d+/);
+                                            const numStr = numMatch ? numMatch[0] : q.id;
+                                            const linkSource = `data:application/pdf;base64,${figBase64}`;
+                                            const downloadLink = document.createElement("a");
+                                            downloadLink.href = linkSource;
+                                            downloadLink.download = `figura_questao_${numStr}_fig${index + 1}.pdf`;
+                                            downloadLink.click();
+                                          }}
+                                          className="text-[8px] font-semibold text-slate-400 hover:text-slate-600 transition-colors hover:underline cursor-pointer"
+                                          title="Baixar formato vetorial original (.pdf)"
+                                        >
+                                          (PDF)
+                                        </button>
+                                      </div>
+                                    ))
+                                  ) : q.figuraBase64 ? (
+                                    <div className="flex flex-col gap-1 items-center">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
+                                        disabled={downloadingPngId === q.id}
+                                        className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                        title="Baixar figura recortada (.png)"
+                                      >
+                                        {downloadingPngId === q.id ? (
+                                          <RefreshCw size={10} className="animate-spin text-amber-500" />
+                                        ) : (
+                                          <FileDown size={10} />
+                                        )}
+                                        <span>Baixar PNG</span>
+                                      </button>
+                                      
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const numMatch = q.numero.match(/\d+/);
+                                          const numStr = numMatch ? numMatch[0] : q.id;
+                                          const linkSource = `data:application/pdf;base64,${q.figuraBase64}`;
+                                          const downloadLink = document.createElement("a");
+                                          downloadLink.href = linkSource;
+                                          downloadLink.download = `figura_questao_${numStr}.pdf`;
+                                          downloadLink.click();
+                                        }}
+                                        className="text-[8px] font-semibold text-slate-400 hover:text-slate-600 transition-colors hover:underline cursor-pointer"
+                                        title="Baixar no formato vetorial original (.pdf)"
+                                      >
+                                        (Baixar PDF Vetorial)
+                                      </button>
+                                    </div>
+                                  ) : null}
                                 </div>
                               )}
                             </div>

@@ -104,14 +104,15 @@ const ai = new GoogleGenAI({
 
 // Priority list of models to gracefully fallback if high-demand (503), quota (429) or connection resets occur
 const CANDIDATE_MODELS = [
-  'gemini-3.8-flash',
   'gemini-3.1-flash-lite',
+  'gemini-3.5-flash',
+  'gemini-3.8-flash',
   'gemini-flash-latest'
 ];
 
 /// Helper to execute Gemini calls with automatic exponential backoff for transient 503/high-demand errors,
 /// network drops (fetch failed, ECONNRESET, ETIMEDOUT), and dynamic model fallbacks on 429 quota exhaustion.
-async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPerModel = 2) {
+async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPerModel = 3) {
   let lastError: any = new Error('Falha ao obter resposta do Gemini após várias tentativas e modelos de fallback.');
 
   // Try each candidate model in order of reliability and availability
@@ -159,19 +160,26 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPe
           causeCode === 'ETIMEDOUT' ||
           causeCode === 'UND_ERR_SOCKET';
 
-        console.warn(`[Gemini API] Falha no modelo '${model}' (tentativa ${attempt}): ${errorMsg || errorStr}`);
+        console.warn(`[Gemini API] Falha no modelo '${model}' na tentativa ${attempt}: ${errorMsg || errorStr}`);
 
-        // If high demand (503), quota exhausted (429), or connection dropped, immediately switch to next model
+        // If it's a recoverable error (503, 429, or network drop) and we have retries remaining,
+        // perform true exponential backoff with jitter on the SAME model first!
         if (is503 || is429 || isNetworkOrReset) {
-          console.warn(`[Gemini API] Modelo '${model}' instável ou sob alta demanda. Alternando para o próximo modelo candidato...`);
-          await new Promise(resolve => setTimeout(resolve, 500));
-          break; // break inner loop to try next model in CANDIDATE_MODELS
-        }
-
-        // For other recoverable errors, backoff and retry
-        if (attempt < maxRetriesPerModel) {
-          await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+          if (attempt < maxRetriesPerModel) {
+            // Calculate base: attempt 1 -> 2.5s, attempt 2 -> 6.25s
+            const baseWaitMs = Math.pow(2.5, attempt) * 1000;
+            const jitter = Math.random() * 1000; // up to 1000ms jitter to prevent thundering herds
+            const waitTimeMs = baseWaitMs + jitter;
+            
+            console.log(`[Gemini API] Erro recobertável (${is503 ? '503' : is429 ? '429' : 'Rede'}). Aplicando backoff exponencial: aguardando ${Math.round(waitTimeMs)}ms antes de tentar novamente...`);
+            await new Promise(resolve => setTimeout(resolve, waitTimeMs));
+          } else {
+            console.warn(`[Gemini API] Limite de tentativas esgotado para o modelo '${model}'. Alternando para o próximo candidato...`);
+          }
         } else {
+          // For other non-recoverable errors (e.g. prompt block, syntax, bad parameters),
+          // don't waste time retrying; switch models immediately
+          console.warn(`[Gemini API] Erro não-recuperável no modelo '${model}'. Alternando de modelo...`);
           break;
         }
       }
@@ -424,7 +432,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
       model: "gemini-3.8-flash",
       contents: contents,
       config: {
-        maxOutputTokens: 65536,
+        maxOutputTokens: 8192,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.ARRAY,
@@ -509,75 +517,96 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
       }
     }
     // Process each question to crop figures using pdf-lib if figures and bbox are provided
-    for (const q of parsedJson) {
-      if (q.temFigura && Array.isArray(q.figuras) && q.figuras.length > 0) {
-        try {
-          const matchNum = String(q.numero || '').match(/\d+/);
-          const reqNum = matchNum ? parseInt(matchNum[0], 10) : null;
-          
-          if (reqNum) {
-            // Find which page index this question is on (0-indexed) using ultra-robust regex matching
-            const regex1 = new RegExp(`(?:QUESTÃO|Questão|Questao)\\s*(?:de\\s+)?(?:n[º°o]\\s*)?\\s*[:-–—]?\\s*${reqNum}\\b`, 'i');
-            const regex2 = new RegExp(`(?:^|\\n|\\r)\\s*${reqNum}\\s*[\\.\\-–—]\\s*`, 'i');
-            let foundPageIdx = -1;
-            for (let i = 0; i < orderedPages.length; i++) {
-              const pageText = orderedPages[i] || '';
-              if (regex1.test(pageText) || regex2.test(pageText)) {
-                foundPageIdx = i;
-                break;
-              }
-            }
+    // Load the source PDF document EXACTLY ONCE to avoid heavy repetitive loading overhead
+    let sourcePdfDoc: PDFDocument | null = null;
+    try {
+      sourcePdfDoc = await PDFDocument.load(fullPdfBuffer);
+    } catch (loadErr) {
+      console.error('[Figure Cropper] Falha ao carregar o documento PDF de origem para extração:', loadErr);
+    }
 
-            if (foundPageIdx !== -1) {
-              const fig = q.figuras[0];
-              if (fig && fig.bbox) {
-                const bbox = fig.bbox;
-                
-                // Normalise coordinates dynamically if they are on a [0, 1000] integer scale
-                let normX = bbox.x;
-                let normY = bbox.y;
-                let normW = bbox.width;
-                let normH = bbox.height;
-
-                if (normX > 1.0 || normY > 1.0 || normW > 1.0 || normH > 1.0) {
-                  normX = normX / 1000.0;
-                  normY = normY / 1000.0;
-                  normW = normW / 1000.0;
-                  normH = normH / 1000.0;
+    if (sourcePdfDoc) {
+      for (const q of parsedJson) {
+        if (q.temFigura && Array.isArray(q.figuras) && q.figuras.length > 0) {
+          try {
+            const matchNum = String(q.numero || '').match(/\d+/);
+            const reqNum = matchNum ? parseInt(matchNum[0], 10) : null;
+            
+            if (reqNum) {
+              // Find which page index this question is on (0-indexed) using ultra-robust regex matching
+              const regex1 = new RegExp(`(?:QUESTÃO|Questão|Questao)\\s*(?:de\\s+)?(?:n[º°o]\\s*)?\\s*[:-–—]?\\s*${reqNum}\\b`, 'i');
+              const regex2 = new RegExp(`(?:^|\\n|\\r)\\s*${reqNum}\\s*[\\.\\-–—]\\s*`, 'i');
+              let foundPageIdx = -1;
+              for (let i = 0; i < orderedPages.length; i++) {
+                const pageText = orderedPages[i] || '';
+                if (regex1.test(pageText) || regex2.test(pageText)) {
+                  foundPageIdx = i;
+                  break;
                 }
+              }
+
+              if (foundPageIdx !== -1) {
+                q.figurasBase64 = []; // initialize array to store multiple cropped figures
                 
-                // Load an isolated instance of the source PDF document for this figure
-                const pdfDoc = await PDFDocument.load(fullPdfBuffer);
-                const page = pdfDoc.getPage(foundPageIdx);
-                const viewBox = page.getMediaBox();
+                // Process ALL figures in the figures array
+                for (let figIdx = 0; figIdx < q.figuras.length; figIdx++) {
+                  const fig = q.figuras[figIdx];
+                  if (fig && fig.bbox) {
+                    const bbox = fig.bbox;
+                    
+                    // Normalise coordinates dynamically if they are on a [0, 1000] integer scale
+                    let normX = bbox.x;
+                    let normY = bbox.y;
+                    let normW = bbox.width;
+                    let normH = bbox.height;
 
-                const cropX = viewBox.x + (normX * viewBox.width);
-                // Since Gemini's Y coordinate starts from the top of the viewBox, and PDF starts from bottom
-                const cropY = viewBox.y + viewBox.height - (normY * viewBox.height) - (normH * viewBox.height);
-                const cropWidth = normW * viewBox.width;
-                const cropHeight = normH * viewBox.height;
+                    if (normX > 1.0 || normY > 1.0 || normW > 1.0 || normH > 1.0) {
+                      normX = normX / 1000.0;
+                      normY = normY / 1000.0;
+                      normW = normW / 1000.0;
+                      normH = normH / 1000.0;
+                    }
 
-                // Shift page content on the source page so that the cropped region starts at exactly (0, 0)
-                page.translateContent(-cropX, -cropY);
+                    // Create the cropped destination document
+                    const croppedDoc = await PDFDocument.create();
+                    
+                    // Copy a clean, unmutated page from sourcePdfDoc to the destination document
+                    const [copiedPage] = await croppedDoc.copyPages(sourcePdfDoc, [foundPageIdx]);
+                    croppedDoc.addPage(copiedPage);
 
-                // Set physical and visible boundaries of the source page to (0, 0, cropWidth, cropHeight)
-                // This guarantees standard 0-based origins which is 100% compatible with Adobe Acrobat and all PDF viewers.
-                page.setMediaBox(0, 0, cropWidth, cropHeight);
-                page.setCropBox(0, 0, cropWidth, cropHeight);
+                    const viewBox = copiedPage.getMediaBox();
 
-                // Create the cropped destination document and copy the mutated page
-                const croppedDoc = await PDFDocument.create();
-                const [copiedPage] = await croppedDoc.copyPages(pdfDoc, [foundPageIdx]);
-                croppedDoc.addPage(copiedPage);
+                    const cropX = viewBox.x + (normX * viewBox.width);
+                    // Since Gemini's Y coordinate starts from the top of the viewBox, and PDF starts from bottom
+                    const cropY = viewBox.y + viewBox.height - (normY * viewBox.height) - (normH * viewBox.height);
+                    const cropWidth = normW * viewBox.width;
+                    const cropHeight = normH * viewBox.height;
 
-                const croppedPdfBytes = await croppedDoc.save();
-                q.figuraBase64 = Buffer.from(croppedPdfBytes).toString('base64');
-                console.log(`[Figure Cropper] Sucesso ao cortar figura vetorizada para Questão ${reqNum} na página ${foundPageIdx + 1}`);
+                    // Shift page content on the copied page so that the cropped region starts at exactly (0, 0)
+                    copiedPage.translateContent(-cropX, -cropY);
+
+                    // Set physical and visible boundaries of the copied page to (0, 0, cropWidth, cropHeight)
+                    copiedPage.setMediaBox(0, 0, cropWidth, cropHeight);
+                    copiedPage.setCropBox(0, 0, cropWidth, cropHeight);
+
+                    const croppedPdfBytes = await croppedDoc.save();
+                    const figBase64 = Buffer.from(croppedPdfBytes).toString('base64');
+                    
+                    q.figurasBase64.push(figBase64);
+                    
+                    // Populate single-fig default for backwards compatibility
+                    if (figIdx === 0) {
+                      q.figuraBase64 = figBase64;
+                    }
+                    
+                    console.log(`[Figure Cropper] Sucesso ao cortar figura ${figIdx + 1}/${q.figuras.length} para Questão ${reqNum} na página ${foundPageIdx + 1}`);
+                  }
+                }
               }
             }
+          } catch (cropErr) {
+            console.error('[Figure Cropper] Falha ao cortar a figura da questão:', cropErr);
           }
-        } catch (cropErr) {
-          console.error('[Figure Cropper] Falha ao cortar a figura da questão:', cropErr);
         }
       }
     }
@@ -623,7 +652,7 @@ total: ${totalTime.toFixed(2)} seg
     }
     if (errStr.includes('503') || errStr.includes('high demand') || errStr.includes('UNAVAILABLE')) {
       return res.status(500).json({ 
-        error: 'O modelo da API está sobrecarregado temporariamente por processar arquivos PDF muito extensos. Por favor, tente novamente em alguns segundos!' 
+        error: 'O serviço do Gemini está temporariamente sobrecarregado ou indisponível. O sistema tentou novamente de forma automática com múltiplos modelos e backoff, mas não conseguiu concluir a solicitação no momento. Por favor, tente novamente em alguns instantes!' 
       });
     }
     if (errStr.includes('fetch failed') || errStr.includes('ECONNRESET') || errStr.includes('ETIMEDOUT')) {

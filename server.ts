@@ -14,7 +14,18 @@ import multer from 'multer';
 import { PDFDocument } from 'pdf-lib';
 import { PDFParse } from 'pdf-parse';
 
+import crypto from 'crypto';
+
 dotenv.config();
+
+// In-memory cache for extracted PDF page texts
+// Key: SHA-256 fingerprint of the PDF file buffer
+// Value: string[] of page text contents
+const pdfPageTextCache = new Map<string, string[]>();
+
+function calculateBufferHash(buffer: Buffer): string {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
 
 // Helper to extract text from a PDF page-by-page safely using the modern PDFParse class API
 async function getPdfPagesText(fileBuffer: Buffer): Promise<string[]> {
@@ -206,6 +217,11 @@ DIRETRIZES DE EXTRAÇÃO:
 - Para cada questão, extraia todas as 5 alternativas (A, B, C, D, E), preservando o texto original de cada uma delas com fidelidade total e absoluta.
 - Identifique se a questão possui qualquer figura, tabela, gráfico ou ilustração original associada e defina o campo "temFigura" correspondente (true ou false).
 
+REPRODUÇÃO DE TABELAS, LISTAS E FÓRMULAS (ESSENCIAL):
+- Se a questão contiver tabelas (dados em linhas e colunas), você DEVE transcrevê-las obrigatoriamente usando o ambiente LaTeX "tabular" (ex: \begin{tabular}{|c|c|} \hline Cabeçalho 1 & Cabeçalho 2 \\ \hline Dado 1 & Dado 2 \\ \hline \end{tabular}) diretamente embutido no texto do campo "enunciado", garantindo que ela compile perfeitamente e fique legível.
+- Se a questão contiver listas de itens, tópicos ou enumerações no corpo do enunciado, você DEVE formatá-las obrigatoriamente usando os ambientes LaTeX nativos "itemize" ou "enumerate" (ex: \begin{itemize} \item Item 1 \item Item 2 \end{itemize}).
+- Escreva todas as fórmulas físicas, variáveis ou números com expoentes usando a notação matemática nativa do LaTeX (ex: $E = m \cdot c^2$, $2 \cdot 10^3\text{ J}$, $5\text{ m/s}$) para que a renderização no arquivo .tex compilado seja profissional e legível.
+
 DIRETRIZES DE CLASSIFICAÇÃO:
 - Classifique cada questão individualmente em uma das 6 temáticas oficiais do ENEM: Mecânica, Eletricidade e Magnetismo, Termologia, Óptica, Ondulatória, Física Moderna. Caso a questão não pertença a nenhuma destas áreas ou não seja identificável, defina o campo "tema" como null.
 - Defina o subtema específico correspondente (ex: Cinemática, Dinâmica, Eletrostática, Calorimetria, etc.).
@@ -227,6 +243,7 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
 
     // Read full PDF buffer
     const fullPdfBuffer = await fs.promises.readFile(file.path);
+    const pdfHash = calculateBufferHash(fullPdfBuffer);
 
     // Local Search & Precise Page Selection Optimization
     const requestedNumbers = examText.split(',').map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => !isNaN(n));
@@ -235,8 +252,23 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
 
     if (requestedNumbers.length > 0) {
       try {
-        console.log('[Local Optimization] Analisando texto das páginas do PDF localmente...');
-        const orderedPages = await getPdfPagesText(fullPdfBuffer);
+        let orderedPages: string[] = [];
+        if (pdfPageTextCache.has(pdfHash)) {
+          console.log(`[Cache Hit] Utilizando textos das páginas indexados do cache local (Hash: ${pdfHash}).`);
+          orderedPages = pdfPageTextCache.get(pdfHash)!;
+        } else {
+          console.log(`[Cache Miss] Analisando texto das páginas do PDF localmente (Hash: ${pdfHash})...`);
+          orderedPages = await getPdfPagesText(fullPdfBuffer);
+          pdfPageTextCache.set(pdfHash, orderedPages);
+          console.log(`[Cache Map] Textos salvos no cache local para reuso em futuras requisições.`);
+          
+          // Keep cache size under control (e.g., max 50 PDFs cached in memory)
+          if (pdfPageTextCache.size > 50) {
+            const firstKey = pdfPageTextCache.keys().next().value;
+            if (firstKey) pdfPageTextCache.delete(firstKey);
+          }
+        }
+
         const pageIndexesToExtract = new Set<number>();
 
         for (const reqNum of requestedNumbers) {
@@ -398,7 +430,16 @@ parse: ${parseTime.toFixed(2)} seg
 total: ${totalTime.toFixed(2)} seg
 `);
 
-    res.json(parsedJson);
+    res.json({
+      questions: parsedJson,
+      performance: {
+        recebimento: recebimentoTime,
+        uploadGemini: uploadGeminiTime,
+        generateContent: generateContentTime,
+        parse: parseTime,
+        total: totalTime
+      }
+    });
 
   } catch (error: any) {
     console.error('Error classifying exam with Gemini:', error);

@@ -26,6 +26,7 @@ import {
   SlidersHorizontal,
   Info,
   RefreshCw,
+  Clock,
   Layers,
   FileDown,
   AlertTriangle,
@@ -150,6 +151,7 @@ export default function App() {
   const [extraQuestions, setExtraQuestions] = useState<number[]>([]);
   const [invalidAlternativesQuestions, setInvalidAlternativesQuestions] = useState<number[]>([]);
   const [showSuccessValidation, setShowSuccessValidation] = useState<boolean>(false);
+  const [performanceMetrics, setPerformanceMetrics] = useState<any | null>(null);
 
   // LaTeX preambles & comments toggle
   const [includeComments, setIncludeComments] = useState(true);
@@ -190,6 +192,7 @@ export default function App() {
     setExtraQuestions([]);
     setInvalidAlternativesQuestions([]);
     setShowSuccessValidation(false);
+    setPerformanceMetrics(null);
 
     const formData = new FormData();
     formData.append('pdfFile', pdfFile);
@@ -246,7 +249,7 @@ export default function App() {
         throw new Error(errorMsg);
       }
 
-      let classifiedQuestions: any[] = [];
+      let classifiedQuestions: any = null;
       try {
         classifiedQuestions = safeParseJson(responseText);
       } catch (parseErr) {
@@ -255,12 +258,34 @@ export default function App() {
       }
 
       let rawList: any[] = [];
-      if (Array.isArray(classifiedQuestions)) {
+      let perf: any = null;
+
+      if (classifiedQuestions && typeof classifiedQuestions === 'object' && !Array.isArray(classifiedQuestions)) {
+        if (Array.isArray(classifiedQuestions.questions)) {
+          rawList = classifiedQuestions.questions;
+        } else {
+          rawList = [classifiedQuestions];
+        }
+        if (classifiedQuestions.performance) {
+          perf = classifiedQuestions.performance;
+        }
+      } else if (Array.isArray(classifiedQuestions)) {
         rawList = classifiedQuestions;
-      } else if (classifiedQuestions && Array.isArray((classifiedQuestions as any).questions)) {
-        rawList = (classifiedQuestions as any).questions;
-      } else if (classifiedQuestions && typeof classifiedQuestions === 'object') {
-        rawList = [classifiedQuestions];
+      }
+
+      if (perf) {
+        setPerformanceMetrics(perf);
+        console.log(
+          `%c[PERFORMANCE] Extração Concluída!\n` +
+          `-----------------------------------\n` +
+          `• Recebimento & Local Split: ${Number(perf.recebimento).toFixed(2)}s\n` +
+          `• Upload Gemini Files API:   ${Number(perf.uploadGemini).toFixed(2)}s\n` +
+          `• Modelo (generateContent):  ${Number(perf.generateContent).toFixed(2)}s\n` +
+          `• Parse e Sanificação JSON:  ${Number(perf.parse).toFixed(2)}s\n` +
+          `• Tempo Total Decorrido:     ${Number(perf.total).toFixed(2)}s\n` +
+          `-----------------------------------`,
+          'color: #0d9488; font-weight: bold; font-size: 13px;'
+        );
       }
 
       if (rawList.length > 0) {
@@ -665,6 +690,38 @@ export default function App() {
                   <p className="text-[10px] text-slate-400 leading-normal mt-0.5">
                     *Questões com estrutura inválida ou excedente podem ser excluídas, ou corrigidas manualmente clicando em "Editar" na lista abaixo.
                   </p>
+                </div>
+              )}
+
+              {/* Performance Metrics Card */}
+              {performanceMetrics && (
+                <div className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-lg text-[11px] space-y-1.5 shadow-2xs mt-4">
+                  <div className="flex gap-1.5 items-center font-bold text-indigo-950">
+                    <Clock size={14} className="shrink-0 text-indigo-600" />
+                    <span>Métricas de Tempo do Backend</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-slate-600 text-[10px]">
+                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
+                      <span className="block text-slate-400 font-medium">Pré-proc. Local:</span>
+                      <span className="font-bold text-slate-800">{Number(performanceMetrics.recebimento).toFixed(2)}s</span>
+                    </div>
+                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
+                      <span className="block text-slate-400 font-medium">Upload Gemini:</span>
+                      <span className="font-bold text-slate-800">{Number(performanceMetrics.uploadGemini).toFixed(2)}s</span>
+                    </div>
+                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
+                      <span className="block text-slate-400 font-medium">IA (Gemini API):</span>
+                      <span className="font-bold text-indigo-700">{Number(performanceMetrics.generateContent).toFixed(2)}s</span>
+                    </div>
+                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
+                      <span className="block text-slate-400 font-medium">Sanificar JSON:</span>
+                      <span className="font-bold text-slate-800">{Number(performanceMetrics.parse).toFixed(2)}s</span>
+                    </div>
+                  </div>
+                  <div className="pt-1 border-t border-indigo-100 flex items-center justify-between text-[10px] font-bold text-indigo-900">
+                    <span>Tempo Total Decorrido:</span>
+                    <span className="px-1.5 py-0.5 bg-indigo-600 text-white rounded">{Number(performanceMetrics.total).toFixed(2)}s</span>
+                  </div>
                 </div>
               )}
             </form>

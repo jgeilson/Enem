@@ -4,7 +4,7 @@
  */
 
 import express from 'express';
-import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 import { jsonrepair } from 'jsonrepair';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -34,7 +34,7 @@ async function getPdfPagesText(fileBuffer: Buffer): Promise<string[]> {
     const result = await parser.getText();
     // Sort pages by page number (1-based index) ascending
     const sortedPages = [...result.pages].sort((a, b) => a.num - b.num);
-    const orderedPages: string[] = sortedPages.map(p => p.text);
+    const orderedPages: string[] = sortedPages.map(p => p.text || '');
     return orderedPages;
   } finally {
     await parser.destroy();
@@ -104,10 +104,9 @@ const ai = new GoogleGenAI({
 
 // Priority list of models to gracefully fallback if high-demand (503), quota (429) or connection resets occur
 const CANDIDATE_MODELS = [
-  'gemini-3.1-flash-lite',
-  'gemini-flash-latest',
   'gemini-3.8-flash',
-  'gemini-3.5-flash'
+  'gemini-3.1-flash-lite',
+  'gemini-flash-latest'
 ];
 
 /// Helper to execute Gemini calls with automatic exponential backoff for transient 503/high-demand errors,
@@ -226,7 +225,7 @@ RECONHECIMENTO DE FIGURAS COM COORDENADAS (BBOX):
   - "y": coordenada vertical inicial (do topo para a base, de 0.0 a 1.0) do canto superior esquerdo da figura.
   - "width": largura proporcional da figura (de 0.0 a 1.0).
   - "height": altura proporcional da figura (de 0.0 a 1.0).
-- Seja extremamente rigoroso e preciso nas coordenadas para garantir que o corte contenha toda a figura e suas legendas perfeitamente.
+- REQUISITO DE PRECISÃO ABSOLUTA: Seja extremamente rigoroso, milimétrico e cirúrgico ao calcular a bbox. O retângulo deve englobar estritamente a ilustração física e suas legendas imediatas. NÃO inclua textos de enunciado, tabelas de dados ou partes de questões adjacentes (acima ou abaixo). Se o retângulo ficar muito grande ou deslocado, o corte incluirá textos indesejados. Ajuste a coordenada "y" e a "height" para ficarem coladas nas bordas da ilustração.
 
 REPRODUÇÃO DE TABELAS, LISTAS E FÓRMULAS (ESSENCIAL):
 - Se a questão contiver tabelas (dados em linhas e colunas), você DEVE transcrevê-las obrigatoriamente usando o ambiente LaTeX "tabular" (ex: \begin{tabular}{|c|c|} \hline Cabeçalho 1 & Cabeçalho 2 \\ \hline Dado 1 & Dado 2 \\ \hline \end{tabular}) diretamente embutido no texto do campo "enunciado", garantindo que ela compile perfeitamente e fique legível.
@@ -292,15 +291,64 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
         }
 
         const pageIndexesToExtract = new Set<number>();
+        const pageScores = new Map<number, Map<number, number>>(); // map of reqNum -> Map of pageIdx -> score
 
         for (const reqNum of requestedNumbers) {
-          const regex = new RegExp(`QUESTÃO\\s+${reqNum}\\b|Questão\\s+${reqNum}\\b`, 'i');
+          const scoresForNum = new Map<number, number>();
+          
+          // Regex A: "Questão ... 95" (allowing up to 15 characters of any spacing/metadata in between, including newlines)
+          const regexQuestao = new RegExp(`(?:QUESTÃO|Questão|Questao)[\\s\\S]{0,15}\\b${reqNum}\\b`, 'i');
+          
+          // Regex B: "95" at the start of a line or after a newline with a common delimiter
+          const regexStartLine = new RegExp(`(?:^|\\n|\\r)[ \t]*\\b${reqNum}\\b\\s*[\\.\\-–—\\)]`, 'i');
+          
+          // Regex C: standalone number "95" (not part of decimal or date like 1995)
+          const regexStandalone = new RegExp(`(?<!\\d)${reqNum}(?!\\d)`, 'g');
+
           for (let i = 0; i < orderedPages.length; i++) {
-            if (regex.test(orderedPages[i])) {
-              pageIndexesToExtract.add(i);
+            const pageText = orderedPages[i] || '';
+            let score = 0;
+            
+            if (regexQuestao.test(pageText)) {
+              score += 100;
+            }
+            if (regexStartLine.test(pageText)) {
+              score += 50;
+            }
+            
+            // Count standalone occurrences
+            const matches = pageText.match(regexStandalone);
+            if (matches && matches.length > 0) {
+              // Add a small score per standalone occurrence, up to 15 points
+              score += Math.min(matches.length * 3, 15);
+            }
+            
+            if (score > 0) {
+              scoresForNum.set(i, score);
+            }
+          }
+          
+          pageScores.set(reqNum, scoresForNum);
+        }
+
+        for (const reqNum of requestedNumbers) {
+          const scores = pageScores.get(reqNum);
+          if (scores && scores.size > 0) {
+            // Find the page index with the maximum score
+            let bestPageIdx = -1;
+            let maxScore = -1;
+            for (const [pageIdx, score] of scores.entries()) {
+              if (score > maxScore) {
+                maxScore = score;
+                bestPageIdx = pageIdx;
+              }
+            }
+            
+            if (bestPageIdx !== -1 && maxScore >= 12) {
+              pageIndexesToExtract.add(bestPageIdx);
               // Include the next page as well, in case the question flows to the next page!
-              if (i + 1 < orderedPages.length) {
-                pageIndexesToExtract.add(i + 1);
+              if (bestPageIdx + 1 < orderedPages.length) {
+                pageIndexesToExtract.add(bestPageIdx + 1);
               }
             }
           }
@@ -316,7 +364,15 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
           finalPdfPath = splitTempFilePath;
           isSplitUsed = true;
         } else {
-          console.log('[Local Optimization] Nenhuma página correspondente foi localizada pelo texto. Utilizando o PDF completo como fallback seguro.');
+          console.log('[Local Optimization] Nenhuma página correspondente foi localizada pelo texto.');
+          const srcDoc = await PDFDocument.load(fullPdfBuffer);
+          const totalPages = srcDoc.getPageCount();
+          if (totalPages > 15) {
+            return res.status(422).json({
+              error: `Não foi possível localizar o texto das questões (${examText}) no arquivo enviado de ${totalPages} páginas. O PDF pode ser escaneado (imagem) ou está em formato incompatível. Por favor, envie um PDF do ENEM que possua texto pesquisável (selecionável).`
+            });
+          }
+          console.log('[Local Optimization] PDF pequeno (< 15 páginas). Prosseguindo com o PDF completo como fallback seguro.');
         }
       } catch (splitErr) {
         console.warn('[Local Optimization] Falha ao tentar dividir o PDF localmente, utilizando o PDF completo como fallback seguro:', splitErr);
@@ -365,10 +421,9 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
 
     startGenerateContent = Date.now();
     const response: any = await generateContentWithRetry(ai, {
-      model: "gemini-3.5-flash",
+      model: "gemini-3.8-flash",
       contents: contents,
       config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         maxOutputTokens: 65536,
         responseMimeType: "application/json",
         responseSchema: {
@@ -461,11 +516,13 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
           const reqNum = matchNum ? parseInt(matchNum[0], 10) : null;
           
           if (reqNum) {
-            // Find which page index this question is on (0-indexed)
-            const regex = new RegExp(`QUESTÃO\\s+${reqNum}\\b|Questão\\s+${reqNum}\\b`, 'i');
+            // Find which page index this question is on (0-indexed) using ultra-robust regex matching
+            const regex1 = new RegExp(`(?:QUESTÃO|Questão|Questao)\\s*(?:de\\s+)?(?:n[º°o]\\s*)?\\s*[:-–—]?\\s*${reqNum}\\b`, 'i');
+            const regex2 = new RegExp(`(?:^|\\n|\\r)\\s*${reqNum}\\s*[\\.\\-–—]\\s*`, 'i');
             let foundPageIdx = -1;
             for (let i = 0; i < orderedPages.length; i++) {
-              if (regex.test(orderedPages[i])) {
+              const pageText = orderedPages[i] || '';
+              if (regex1.test(pageText) || regex2.test(pageText)) {
                 foundPageIdx = i;
                 break;
               }
@@ -475,20 +532,40 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
               const fig = q.figuras[0];
               if (fig && fig.bbox) {
                 const bbox = fig.bbox;
+                
+                // Normalise coordinates dynamically if they are on a [0, 1000] integer scale
+                let normX = bbox.x;
+                let normY = bbox.y;
+                let normW = bbox.width;
+                let normH = bbox.height;
+
+                if (normX > 1.0 || normY > 1.0 || normW > 1.0 || normH > 1.0) {
+                  normX = normX / 1000.0;
+                  normY = normY / 1000.0;
+                  normW = normW / 1000.0;
+                  normH = normH / 1000.0;
+                }
+                
+                // Load an isolated instance of the source PDF document for this figure
                 const pdfDoc = await PDFDocument.load(fullPdfBuffer);
                 const page = pdfDoc.getPage(foundPageIdx);
-                const { width: pageW, height: pageH } = page.getSize();
+                const viewBox = page.getMediaBox();
 
-                const cropX = bbox.x * pageW;
-                // Since Gemini's Y coordinate starts from the top, and PDF starts from bottom
-                const cropY = pageH - (bbox.y * pageH) - (bbox.height * pageH);
-                const cropWidth = bbox.width * pageW;
-                const cropHeight = bbox.height * pageH;
+                const cropX = viewBox.x + (normX * viewBox.width);
+                // Since Gemini's Y coordinate starts from the top of the viewBox, and PDF starts from bottom
+                const cropY = viewBox.y + viewBox.height - (normY * viewBox.height) - (normH * viewBox.height);
+                const cropWidth = normW * viewBox.width;
+                const cropHeight = normH * viewBox.height;
 
-                // Set bounding box bounds securely
-                page.setMediaBox(cropX, cropY, cropWidth, cropHeight);
-                page.setCropBox(cropX, cropY, cropWidth, cropHeight);
+                // Shift page content on the source page so that the cropped region starts at exactly (0, 0)
+                page.translateContent(-cropX, -cropY);
 
+                // Set physical and visible boundaries of the source page to (0, 0, cropWidth, cropHeight)
+                // This guarantees standard 0-based origins which is 100% compatible with Adobe Acrobat and all PDF viewers.
+                page.setMediaBox(0, 0, cropWidth, cropHeight);
+                page.setCropBox(0, 0, cropWidth, cropHeight);
+
+                // Create the cropped destination document and copy the mutated page
                 const croppedDoc = await PDFDocument.create();
                 const [copiedPage] = await croppedDoc.copyPages(pdfDoc, [foundPageIdx]);
                 croppedDoc.addPage(copiedPage);

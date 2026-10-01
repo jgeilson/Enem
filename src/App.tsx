@@ -159,6 +159,76 @@ export default function App() {
   // Edit Modal State
   const [editingQuestion, setEditingQuestion] = useState<QuestaoFísica | null>(null);
 
+  // PNG Figure Downloader State
+  const [downloadingPngId, setDownloadingPngId] = useState<string | null>(null);
+
+  const handleDownloadPng = async (base64Data: string, numeroStr: string, questionId: string) => {
+    setDownloadingPngId(questionId);
+    try {
+      // Load pdfjsLib dynamically from a CDN if not already on window
+      if (!(window as any).pdfjsLib) {
+        await new Promise<void>((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js';
+          script.async = true;
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error('Falha ao carregar renderizador de imagem.'));
+          document.head.appendChild(script);
+        });
+      }
+
+      const pdfjsLib = (window as any).pdfjsLib;
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+      // Convert Base64 to binary typed array
+      const binaryString = window.atob(base64Data);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const loadingTask = pdfjsLib.getDocument({ data: bytes });
+      const pdfDoc = await loadingTask.promise;
+      const page = await pdfDoc.getPage(1);
+
+      // Render at 3.5x scale for extremely crisp high-definition PNG output
+      const viewport = page.getViewport({ scale: 3.5 });
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Could not get canvas context');
+
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+
+      await page.render({
+        canvasContext: context,
+        viewport: viewport
+      }).promise;
+
+      const pngUrl = canvas.toDataURL('image/png');
+
+      const numMatch = numeroStr.match(/\d+/);
+      const numOnly = numMatch ? numMatch[0] : numeroStr;
+      const downloadLink = document.createElement("a");
+      downloadLink.href = pngUrl;
+      downloadLink.download = `figura_questao_${numOnly}.png`;
+      downloadLink.click();
+    } catch (err) {
+      console.error('[PNG Converter] Falha na conversão de PDF para PNG:', err);
+      // Failover safely to downloading raw vectorized PDF
+      const numMatch = numeroStr.match(/\d+/);
+      const numOnly = numMatch ? numMatch[0] : numeroStr;
+      const linkSource = `data:application/pdf;base64,base64Data`;
+      const downloadLink = document.createElement("a");
+      downloadLink.href = `data:application/pdf;base64,${base64Data}`;
+      downloadLink.download = `figura_questao_${numOnly}.pdf`;
+      downloadLink.click();
+    } finally {
+      setDownloadingPngId(null);
+    }
+  };
+
   // File selection handler
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -970,23 +1040,39 @@ export default function App() {
                               </button>
 
                               {q.temFigura && q.figuraBase64 && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const numMatch = q.numero.match(/\d+/);
-                                    const numStr = numMatch ? numMatch[0] : q.id;
-                                    const linkSource = `data:application/pdf;base64,${q.figuraBase64}`;
-                                    const downloadLink = document.createElement("a");
-                                    downloadLink.href = linkSource;
-                                    downloadLink.download = `figura_questao_${numStr}.pdf`;
-                                    downloadLink.click();
-                                  }}
-                                  className="inline-flex items-center gap-1 text-[9px] font-bold text-indigo-600 hover:text-indigo-800 transition-colors bg-indigo-50 hover:bg-indigo-100 px-1.5 py-0.5 rounded border border-indigo-100/40 cursor-pointer"
-                                  title="Baixar figura vetorizada (.pdf)"
-                                >
-                                  <FileDown size={10} />
-                                  <span>Baixar Vetor</span>
-                                </button>
+                                <div className="flex flex-col gap-1 items-center">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
+                                    disabled={downloadingPngId === q.id}
+                                    className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                    title="Baixar figura recortada (.png)"
+                                  >
+                                    {downloadingPngId === q.id ? (
+                                      <RefreshCw size={10} className="animate-spin text-amber-500" />
+                                    ) : (
+                                      <FileDown size={10} />
+                                    )}
+                                    <span>Baixar PNG</span>
+                                  </button>
+                                  
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const numMatch = q.numero.match(/\d+/);
+                                      const numStr = numMatch ? numMatch[0] : q.id;
+                                      const linkSource = `data:application/pdf;base64,${q.figuraBase64}`;
+                                      const downloadLink = document.createElement("a");
+                                      downloadLink.href = linkSource;
+                                      downloadLink.download = `figura_questao_${numStr}.pdf`;
+                                      downloadLink.click();
+                                    }}
+                                    className="text-[8px] font-semibold text-slate-400 hover:text-slate-600 transition-colors hover:underline cursor-pointer"
+                                    title="Baixar no formato vetorial original (.pdf)"
+                                  >
+                                    (Baixar PDF Vetorial)
+                                  </button>
+                                </div>
                               )}
                             </div>
                           </td>

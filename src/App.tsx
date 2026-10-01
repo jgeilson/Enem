@@ -28,7 +28,8 @@ import {
   RefreshCw,
   Layers,
   FileDown,
-  AlertTriangle
+  AlertTriangle,
+  CheckCircle2
 } from 'lucide-react';
 import { QuestaoFísica } from './types';
 import { safeParseJson } from './utils/safeJson';
@@ -146,6 +147,9 @@ export default function App() {
   const [isClassifying, setIsClassifying] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [missingQuestions, setMissingQuestions] = useState<number[]>([]);
+  const [extraQuestions, setExtraQuestions] = useState<number[]>([]);
+  const [invalidAlternativesQuestions, setInvalidAlternativesQuestions] = useState<number[]>([]);
+  const [showSuccessValidation, setShowSuccessValidation] = useState<boolean>(false);
 
   // LaTeX preambles & comments toggle
   const [includeComments, setIncludeComments] = useState(true);
@@ -183,125 +187,174 @@ export default function App() {
     setIsClassifying(true);
     setErrorMessage(null);
     setMissingQuestions([]);
+    setExtraQuestions([]);
+    setInvalidAlternativesQuestions([]);
+    setShowSuccessValidation(false);
 
     const formData = new FormData();
     formData.append('pdfFile', pdfFile);
     formData.append('examText', validation.normalizedText);
 
-    const maxAttempts = 3;
-
     try {
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          const res = await fetch('/api/classify', {
-            method: 'POST',
-            body: formData,
-          });
+      let res = await fetch('/api/classify', {
+        method: 'POST',
+        body: formData,
+      });
 
-          const responseText = await res.text();
-          const contentType = res.headers.get('content-type') || '';
-          const isHtmlResponse = contentType.includes('text/html') || responseText.trim().startsWith('<') || responseText.includes('<!doctype') || responseText.includes('<html');
+      let responseText = await res.text();
+      let contentType = res.headers.get('content-type') || '';
+      let isHtmlResponse = contentType.includes('text/html') || responseText.trim().startsWith('<') || responseText.includes('<!doctype') || responseText.includes('<html');
 
-          if (!res.ok || isHtmlResponse) {
-            let errorMsg = 'Erro ao processar com a IA.';
+      // Handle server warmup (cold start) retry logic safely, without looping on other API errors
+      if (isHtmlResponse && (responseText.includes('Starting Server') || responseText.includes('warmup') || responseText.includes('Vite') || responseText.includes('<html'))) {
+        setErrorMessage('O servidor está acordando (Cold Start). Aguardando 4 segundos antes de tentar novamente...');
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        
+        setErrorMessage(null);
+        res = await fetch('/api/classify', {
+          method: 'POST',
+          body: formData,
+        });
+        responseText = await res.text();
+        contentType = res.headers.get('content-type') || '';
+        isHtmlResponse = contentType.includes('text/html') || responseText.trim().startsWith('<') || responseText.includes('<!doctype') || responseText.includes('<html');
+      }
 
-            if (isHtmlResponse) {
-              const isWarmup = responseText.includes('Starting Server') || responseText.includes('warmup') || responseText.includes('Vite') || responseText.includes('<html');
-              if (isWarmup && attempt < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                continue;
-              }
-              if (res.status === 413 || responseText.includes('too large') || responseText.includes('Entity Too Large')) {
-                errorMsg = 'O arquivo PDF enviado é muito grande (excede o limite de transferência). Por favor, envie um PDF menor.';
-              } else {
-                errorMsg = 'O servidor está concluindo a inicialização. Por favor, tente clicar novamente em Extrair Questões.';
-              }
-            } else {
-              try {
-                const errData = JSON.parse(responseText);
-                errorMsg = errData.error || errorMsg;
-              } catch {
-                if (res.status === 413) {
-                  errorMsg = 'O arquivo PDF enviado é muito grande. Por favor, reduza o tamanho do PDF.';
-                } else if (res.status === 429) {
-                  errorMsg = 'Limite de cota de inteligência artificial temporariamente excedido. Aguarde alguns instantes.';
-                } else if ((res.status === 503 || res.status === 502 || res.status === 504) && attempt < maxAttempts) {
-                  await new Promise(resolve => setTimeout(resolve, 2000));
-                  continue;
-                } else {
-                  errorMsg = `Erro no servidor (${res.status}). Por favor, tente novamente.`;
-                }
-              }
-            }
-            throw new Error(errorMsg);
-          }
+      if (!res.ok || isHtmlResponse) {
+        let errorMsg = 'Erro ao processar com a IA.';
 
-          let classifiedQuestions: any[] = [];
-          try {
-            classifiedQuestions = safeParseJson(responseText);
-          } catch (parseErr) {
-            console.error('Falha ao converter resposta da IA em JSON:', parseErr, responseText);
-            throw new Error('A resposta gerada não pôde ser interpretada como lista de questões. Por favor, tente novamente.');
-          }
-
-          let rawList: any[] = [];
-          if (Array.isArray(classifiedQuestions)) {
-            rawList = classifiedQuestions;
-          } else if (classifiedQuestions && Array.isArray((classifiedQuestions as any).questions)) {
-            rawList = (classifiedQuestions as any).questions;
-          } else if (classifiedQuestions && typeof classifiedQuestions === 'object') {
-            rawList = [classifiedQuestions];
-          }
-
-          if (rawList.length > 0) {
-            const mapped = rawList.map((q: any, idx: number) => ({
-              ...q,
-              id: `custom-${Date.now()}-${idx}`,
-              numero: q.numero || `Questão ${idx + 1}`,
-              enunciado: q.enunciado || '',
-              tema: q.tema || 'Mecânica',
-              subtema: q.subtema || '',
-              alternativas: Array.isArray(q.alternativas) ? q.alternativas : [],
-              temFigura: typeof q.temFigura === 'boolean' ? q.temFigura : (!!q.figura || false)
-            }));
-
-            // VERIFY EXTRACTION OF REQUESTED QUESTIONS (EXTRACTION VALIDATOR)
-            if (validation.numbers && validation.numbers.length > 0) {
-              const missing: number[] = [];
-              for (const reqNum of validation.numbers) {
-                const isFound = mapped.some((mq: any) => {
-                  const numStr = String(mq.numero || '');
-                  const regex = new RegExp(`\\b${reqNum}\\b`);
-                  return regex.test(numStr);
-                });
-                if (!isFound) {
-                  missing.push(reqNum);
-                }
-              }
-              setMissingQuestions(missing);
-            } else {
-              setMissingQuestions([]);
-            }
-
-            // Adiciona novas questões ao início e seleciona-as automaticamente
-            setQuestions(prev => [...mapped, ...prev]);
-            setSelectedIds(prev => [...mapped.map(m => m.id), ...prev]);
-            
-            // Limpa formulário
-            setPdfFile(null);
-            setPdfFileName(null);
-            return;
+        if (isHtmlResponse) {
+          if (res.status === 413 || responseText.includes('too large') || responseText.includes('Entity Too Large')) {
+            errorMsg = 'O arquivo PDF enviado é muito grande (excede o limite de transferência). Por favor, envie um PDF menor.';
           } else {
-            setErrorMessage('Nenhuma questão de Física foi identificada no arquivo PDF enviado. Certifique-se de carregar o arquivo correto.');
-            return;
+            errorMsg = 'O servidor está concluindo a inicialização. Por favor, tente clicar novamente em Extrair Questões.';
           }
-        } catch (err: any) {
-          if (attempt === maxAttempts) {
-            console.error(err);
-            setErrorMessage(err?.message || 'Falha na conexão com o servidor de Inteligência Artificial.');
+        } else {
+          try {
+            const errData = JSON.parse(responseText);
+            errorMsg = errData.error || errorMsg;
+          } catch {
+            if (res.status === 413) {
+              errorMsg = 'O arquivo PDF enviado é muito grande. Por favor, reduza o tamanho do PDF.';
+            } else if (res.status === 429) {
+              errorMsg = 'Limite de cota de inteligência artificial temporariamente excedido. Aguarde alguns instantes ou ative o Plano Premium.';
+            } else {
+              errorMsg = `Erro no servidor (${res.status}). Por favor, tente novamente.`;
+            }
           }
         }
+        throw new Error(errorMsg);
       }
+
+      let classifiedQuestions: any[] = [];
+      try {
+        classifiedQuestions = safeParseJson(responseText);
+      } catch (parseErr) {
+        console.error('Falha ao converter resposta da IA em JSON:', parseErr, responseText);
+        throw new Error('A resposta gerada não pôde ser interpretada como lista de questões. Por favor, tente novamente.');
+      }
+
+      let rawList: any[] = [];
+      if (Array.isArray(classifiedQuestions)) {
+        rawList = classifiedQuestions;
+      } else if (classifiedQuestions && Array.isArray((classifiedQuestions as any).questions)) {
+        rawList = (classifiedQuestions as any).questions;
+      } else if (classifiedQuestions && typeof classifiedQuestions === 'object') {
+        rawList = [classifiedQuestions];
+      }
+
+      if (rawList.length > 0) {
+        // Track structurally invalid alternatives in the incoming raw list
+        const invalidAlts: number[] = [];
+
+        const mapped = rawList.map((q: any, idx: number) => {
+          const origAlts = Array.isArray(q.alternativas) ? q.alternativas : [];
+          const origHasExactlyFive = origAlts.length === 5;
+          const origHasCorrectLetters = origHasExactlyFive && ['A', 'B', 'C', 'D', 'E'].every((l, i) => {
+            const alt = origAlts[i];
+            return alt && String(alt.letra || '').toUpperCase() === l;
+          });
+          const origHasTexts = origAlts.every((alt: any) => alt && String(alt.texto || '').trim() !== '');
+
+          const matchNum = String(q.numero || '').match(/\d+/);
+          const qNum = matchNum ? parseInt(matchNum[0], 10) : (idx + 1);
+
+          if (!origHasExactlyFive || !origHasCorrectLetters || !origHasTexts) {
+            invalidAlts.push(qNum);
+          }
+
+          // Normalize / Heal to exactly [A, B, C, D, E] for UI rendering and safety
+          const letters = ['A', 'B', 'C', 'D', 'E'];
+          const normalizedAlts = letters.map((l) => {
+            const existing = origAlts.find((a: any) => a && String(a.letra || '').toUpperCase() === l);
+            return existing ? { letra: l, texto: existing.texto || '' } : { letra: l, texto: '' };
+          });
+
+          return {
+            ...q,
+            id: `custom-${Date.now()}-${idx}`,
+            numero: q.numero || `Questão ${qNum}`,
+            enunciado: q.enunciado || '',
+            tema: q.tema ?? null,
+            subtema: q.subtema || '',
+            alternativas: normalizedAlts,
+            temFigura: typeof q.temFigura === 'boolean' ? q.temFigura : (!!q.figura || false)
+          };
+        });
+
+        // VERIFY EXTRACTION OF REQUESTED QUESTIONS (EXTRACTION VALIDATOR)
+        if (validation.numbers && validation.numbers.length > 0) {
+          const missing: number[] = [];
+          for (const reqNum of validation.numbers) {
+            const isFound = mapped.some((mq: any) => {
+              const numStr = String(mq.numero || '');
+              const regex = new RegExp(`\\b${reqNum}\\b`);
+              return regex.test(numStr);
+            });
+            if (!isFound) {
+              missing.push(reqNum);
+            }
+          }
+          setMissingQuestions(missing);
+
+          const extra: number[] = [];
+          for (const mq of mapped) {
+            const numStr = String(mq.numero || '');
+            const matchNum = numStr.match(/\d+/);
+            if (matchNum) {
+              const returnedNum = parseInt(matchNum[0], 10);
+              if (returnedNum >= 91 && returnedNum <= 135 && !validation.numbers.includes(returnedNum)) {
+                if (!extra.includes(returnedNum)) {
+                  extra.push(returnedNum);
+                }
+              }
+            }
+          }
+          setExtraQuestions(extra);
+          setInvalidAlternativesQuestions(invalidAlts);
+          setShowSuccessValidation(missing.length === 0 && extra.length === 0 && invalidAlts.length === 0);
+        } else {
+          setMissingQuestions([]);
+          setExtraQuestions([]);
+          setInvalidAlternativesQuestions([]);
+          setShowSuccessValidation(false);
+        }
+
+        // Adiciona novas questões ao início e seleciona-as automaticamente
+        setQuestions(prev => [...mapped, ...prev]);
+        setSelectedIds(prev => [...mapped.map(m => m.id), ...prev]);
+        
+        // Limpa formulário
+        setPdfFile(null);
+        setPdfFileName(null);
+        return;
+      } else {
+        setErrorMessage('Nenhuma questão de Física foi identificada no arquivo PDF enviado. Certifique-se de carregar o arquivo correto.');
+        return;
+      }
+    } catch (err: any) {
+      console.error(err);
+      setErrorMessage(err?.message || 'Falha na conexão com o servidor de Inteligência Artificial.');
     } finally {
       setIsClassifying(false);
     }
@@ -358,7 +411,9 @@ export default function App() {
   // Filtered lists of questions to display in main view
   const filteredQuestions = useMemo(() => {
     return questions.filter(q => {
-      const matchesTheme = selectedTheme === 'Todos' || q.tema === selectedTheme;
+      const matchesTheme = selectedTheme === 'Todos' 
+        || (selectedTheme === 'Ausentes' && q.tema === null)
+        || q.tema === selectedTheme;
       const matchesSearch = !searchTerm.trim() || 
         q.numero.toLowerCase().includes(searchTerm.toLowerCase()) ||
         q.enunciado.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -541,28 +596,69 @@ export default function App() {
               )}
 
               {/* Extraction Validator Alerts */}
-              {missingQuestions.length > 0 && (
-                <div className="p-3 bg-amber-50 border border-amber-100 text-amber-900 rounded-lg text-[11px] leading-relaxed flex flex-col gap-1.5 shadow-xs">
+              {showSuccessValidation && (
+                <div className="p-3 bg-emerald-50 border border-emerald-100 text-emerald-900 rounded-lg text-[11px] leading-relaxed flex flex-col gap-1 shadow-xs">
+                  <div className="flex gap-1.5 items-center font-bold text-emerald-800">
+                    <CheckCircle2 size={14} className="shrink-0 text-emerald-600" />
+                    <span>Extração Perfeita (100% Válida)</span>
+                  </div>
+                  <p className="text-slate-600 font-medium text-[10px]">
+                    Todas as questões solicitadas foram retornadas com precisão absoluta, sem nenhuma falta ou excedente.
+                  </p>
+                </div>
+              )}
+
+              {(missingQuestions.length > 0 || extraQuestions.length > 0 || invalidAlternativesQuestions.length > 0) && (
+                <div className="p-3 bg-amber-50 border border-amber-100 text-amber-900 rounded-lg text-[11px] leading-relaxed flex flex-col gap-2 shadow-xs">
                   <div className="flex gap-1.5 items-center font-bold text-amber-800">
                     <AlertTriangle size={14} className="shrink-0 text-amber-600" />
-                    <span>Validação de Extração:</span>
+                    <span>Validação: Divergência Detectada</span>
                   </div>
-                  <p className="text-slate-600 font-medium">
-                    {missingQuestions.length === 1 ? (
-                      <>A seguinte questão solicitada não foi localizada no PDF carregado pela IA:</>
-                    ) : (
-                      <>As seguintes questões solicitadas não foram localizadas no PDF carregado pela IA:</>
-                    )}
+                  <p className="text-slate-600 font-medium text-[10px] leading-snug">
+                    O conjunto de questões retornadas possui pendências ou não corresponde exatamente ao solicitado.
                   </p>
-                  <div className="flex flex-wrap gap-1 mt-0.5">
-                    {missingQuestions.map(num => (
-                      <span key={num} className="px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded font-mono text-[10px] font-bold border border-amber-200/50">
-                        Questão {num}
-                      </span>
-                    ))}
-                  </div>
-                  <p className="text-[10px] text-slate-400 leading-normal mt-1">
-                    *Isso geralmente ocorre se o caderno não for correspondente, se o número de questão não pertencer à área de Ciências da Natureza ou se ela não for classificada como questão de Física.
+                  
+                  {missingQuestions.length > 0 && (
+                    <div className="space-y-1">
+                      <span className="font-bold text-red-700 block text-[10px]">Faltaram (solicitadas mas não retornadas):</span>
+                      <div className="flex flex-wrap gap-1">
+                        {missingQuestions.map(num => (
+                          <span key={num} className="px-1.5 py-0.5 bg-red-100 text-red-800 rounded font-mono text-[10px] font-bold border border-red-200/50">
+                            Questão {num}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {extraQuestions.length > 0 && (
+                    <div className="space-y-1">
+                      <span className="font-bold text-amber-700 block text-[10px]">Excedentes (retornadas mas não solicitadas):</span>
+                      <div className="flex flex-wrap gap-1">
+                        {extraQuestions.map(num => (
+                          <span key={num} className="px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded font-mono text-[10px] font-bold border border-amber-200/50">
+                            Questão {num}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {invalidAlternativesQuestions.length > 0 && (
+                    <div className="space-y-1">
+                      <span className="font-bold text-red-700 block text-[10px]">⚠ Estrutura de Alternativas Inválida (faltando A-E ou texto em branco):</span>
+                      <div className="flex flex-wrap gap-1">
+                        {invalidAlternativesQuestions.map(num => (
+                          <span key={num} className="px-1.5 py-0.5 bg-red-100 text-red-800 rounded font-mono text-[10px] font-bold border border-red-200/50">
+                            Questão {num}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <p className="text-[10px] text-slate-400 leading-normal mt-0.5">
+                    *Questões com estrutura inválida ou excedente podem ser excluídas, ou corrigidas manualmente clicando em "Editar" na lista abaixo.
                   </p>
                 </div>
               )}
@@ -659,7 +755,7 @@ export default function App() {
 
             {/* Theme Filter badgelist */}
             <div className="flex items-center gap-1.5 flex-wrap">
-              {['Todos', 'Mecânica', 'Eletricidade e Magnetismo', 'Termologia', 'Óptica', 'Ondulatória', 'Física Moderna'].map(theme => {
+              {['Todos', 'Mecânica', 'Eletricidade e Magnetismo', 'Termologia', 'Óptica', 'Ondulatória', 'Física Moderna', 'Ausentes'].map(theme => {
                 const isActive = selectedTheme === theme;
                 return (
                   <button
@@ -732,11 +828,13 @@ export default function App() {
                   <tbody className="divide-y divide-slate-100">
                     {filteredQuestions.map((q) => {
                       const isSelected = selectedIds.includes(q.id);
-                      const meta = themeMeta[q.tema] || { icon: FileText, color: 'text-slate-600', bg: 'bg-slate-50', border: 'border-slate-100' };
+                      const meta = q.tema 
+                        ? (themeMeta[q.tema] || { icon: FileText, color: 'text-slate-600', bg: 'bg-slate-50', border: 'border-slate-100' })
+                        : { icon: AlertTriangle, color: 'text-red-500 animate-pulse', bg: 'bg-red-50', border: 'border-red-100' };
                       const ThemeIcon = meta.icon;
 
                       return (
-                        <tr key={q.id} className={`hover:bg-slate-50/60 transition-colors group ${isSelected ? 'bg-indigo-50/10' : ''}`}>
+                        <tr key={q.id} className={`hover:bg-slate-50/60 transition-colors group ${isSelected ? 'bg-indigo-50/10' : ''} ${!q.tema ? 'bg-red-50/5 hover:bg-red-50/10' : ''}`}>
                           
                           {/* Selector */}
                           <td className="px-5 py-3.5">
@@ -766,10 +864,15 @@ export default function App() {
                             <div className="flex items-center gap-1.5">
                               <ThemeIcon size={12} className={`${meta.color} shrink-0`} />
                               <select
-                                value={q.tema}
-                                onChange={(e) => handleUpdateTheme(q.id, e.target.value as any)}
-                                className="text-xs font-semibold text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-md py-1 px-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
+                                value={q.tema || ''}
+                                onChange={(e) => handleUpdateTheme(q.id, e.target.value === '' ? null : e.target.value as any)}
+                                className={`text-xs font-semibold border rounded-md py-1 px-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer ${
+                                  q.tema 
+                                    ? 'text-slate-700 bg-slate-50 hover:bg-slate-100 border-slate-200' 
+                                    : 'text-red-700 bg-red-50 hover:bg-red-100/80 border-red-200 font-bold'
+                                }`}
                               >
+                                <option value="">⚠ Classificação Ausente</option>
                                 {['Mecânica', 'Eletricidade e Magnetismo', 'Termologia', 'Óptica', 'Ondulatória', 'Física Moderna'].map(themeOption => (
                                   <option key={themeOption} value={themeOption}>{themeOption}</option>
                                 ))}

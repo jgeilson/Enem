@@ -12,7 +12,7 @@ export interface QuestaoFísica {
   id: string;
   numero: string;
   enunciado: string;
-  tema: 'Mecânica' | 'Eletricidade e Magnetismo' | 'Termologia' | 'Óptica' | 'Ondulatória' | 'Física Moderna';
+  tema: 'Mecânica' | 'Eletricidade e Magnetismo' | 'Termologia' | 'Óptica' | 'Ondulatória' | 'Física Moderna' | null;
   subtema: string;
   alternativas: Alternativa[];
   temFigura: boolean;

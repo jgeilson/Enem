@@ -189,26 +189,37 @@ app.post('/api/classify', upload.single('pdfFile'), async (req, res) => {
   let uploadedRemoteFile: any = null;
   let splitTempFilePath: string | null = null;
 
+  const startTotal = Date.now();
+  let startUploadGemini = 0;
+  let endUploadGemini = 0;
+  let startGenerateContent = 0;
+  let endGenerateContent = 0;
+  let startParse = 0;
+  let endParse = 0;
+
   try {
-    const finalPrompt = `Você é um professor de física experiente, especializado no ENEM. 
-Sua tarefa é analisar o documento fornecido e extrair EXCLUSIVAMENTE as questões solicitadas pelo usuário: [${examText}].
+    const finalPrompt = `Extraia e classifique as questões solicitadas do documento ENEM: [${examText}].
 
-Instruções críticas para otimização de processamento:
-1. Ignore completamente todo o restante do PDF. Concentre seu processamento APENAS em localizar as questões numéricas correspondentes aos números: ${examText}.
-2. Para cada uma dessas questões listadas, extraia o enunciado completo, as alternativas (A a E) e identifique se ela possui qualquer tipo de figura, tabela de dados ou gráfico original associado (definindo "temFigura" como true ou false). IMPORTANTE: Preserve com fidelidade absoluta o enunciado original, todos os valores numéricos, algarismos significativos (ex: mantenha "0,50 m" exatamente e NUNCA simplifique ou altere para "0,5 m"), notações científicas, unidades de medida e os textos originais das alternativas exatamente como aparecem na prova.
-3. Classifique-as individualmente em uma das 6 temáticas oficiais (Mecânica, Eletricidade e Magnetismo, Termologia, Óptica, Ondulatória, Física Moderna) e defina o subtema correspondente.
-4. Não extraia gabaritos nem escreva resoluções didáticas para economizar tokens, reduzir o uso de IA e acelerar a resposta.
+DIRETRIZES DE EXTRAÇÃO:
+- Localize e transcreva EXCLUSIVAMENTE as questões com os números: ${examText}. Ignore todo o restante do documento PDF.
+- Preserve com fidelidade absoluta o enunciado original: transcreva todo o texto integralmente, sem simplificações, sem resumos, mantendo rigorosamente todos os valores numéricos, algarismos significativos (ex: mantenha "0,50 m" exatamente e NUNCA simplifique ou altere para "0,5 m"), notações científicas, fórmulas e unidades de medida exatamente como aparecem no PDF original.
+- Para cada questão, extraia todas as 5 alternativas (A, B, C, D, E), preservando o texto original de cada uma delas com fidelidade total e absoluta.
+- Identifique se a questão possui qualquer figura, tabela, gráfico ou ilustração original associada e defina o campo "temFigura" correspondente (true ou false).
 
-Você deve retornar estritamente um array JSON contendo objetos com a seguinte estrutura de tipos:
+DIRETRIZES DE CLASSIFICAÇÃO:
+- Classifique cada questão individualmente em uma das 6 temáticas oficiais do ENEM: Mecânica, Eletricidade e Magnetismo, Termologia, Óptica, Ondulatória, Física Moderna. Caso a questão não pertença a nenhuma destas áreas ou não seja identificável, defina o campo "tema" como null.
+- Defina o subtema específico correspondente (ex: Cinemática, Dinâmica, Eletrostática, Calorimetria, etc.).
+- Não extraia gabaritos nem escreva resoluções pedagógicas para economizar tokens e agilizar o retorno.
+
+Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte formato:
 [
   {
     "numero": "Questão XX (ENEM YYYY)",
-    "enunciado": "O enunciado limpo da questão...",
+    "enunciado": "Enunciado original transcrito da questão...",
     "tema": "Mecânica",
     "subtema": "Cinemática",
     "alternativas": [
-      { "letra": "A", "texto": "Texto..." },
-      ...
+      { "letra": "A", "texto": "Texto original transcrito da alternativa..." }
     ],
     "temFigura": true
   }
@@ -258,6 +269,7 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
       }
     }
 
+    startUploadGemini = Date.now();
     const contents: any[] = [];
     
     // Use Gemini Files API for reliable upload of dense PDF documents.
@@ -293,9 +305,11 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
         }
       });
     }
+    endUploadGemini = Date.now();
     
     contents.push({ text: finalPrompt });
 
+    startGenerateContent = Date.now();
     const response: any = await generateContentWithRetry(ai, {
       model: "gemini-3.5-flash",
       contents: contents,
@@ -325,12 +339,14 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
               },
               temFigura: { type: Type.BOOLEAN }
             },
-            required: ["numero", "enunciado", "tema", "subtema", "alternativas", "temFigura"]
+            required: ["numero", "enunciado", "subtema", "alternativas", "temFigura"]
           }
         }
       }
     });
+    endGenerateContent = Date.now();
 
+    startParse = Date.now();
     let rawText = response.text || '[]';
     rawText = rawText.trim();
     if (rawText.startsWith('```')) {
@@ -344,31 +360,12 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
       parsedJson = JSON.parse(rawText);
     } catch {
       try {
+        console.warn('[Gemini Output] Falha no parse inicial do JSON. Tentando reparação com jsonrepair...');
         const repaired = jsonrepair(rawText);
         parsedJson = JSON.parse(repaired);
-      } catch (parseErr) {
-        console.warn('[Gemini Output] JSON necessitando recuperação estrutural profunda...');
-        const lastObjClose = rawText.lastIndexOf('},');
-        if (lastObjClose !== -1) {
-          const recovered = rawText.slice(0, lastObjClose + 1) + ']';
-          try {
-            parsedJson = JSON.parse(jsonrepair(recovered));
-          } catch {
-            parsedJson = JSON.parse(recovered);
-          }
-        } else {
-          const lastBrace = rawText.lastIndexOf('}');
-          if (lastBrace !== -1) {
-            const recovered = rawText.slice(0, lastBrace + 1) + ']';
-            try {
-              parsedJson = JSON.parse(jsonrepair(recovered));
-            } catch {
-              parsedJson = JSON.parse(recovered);
-            }
-          } else {
-            throw parseErr;
-          }
-        }
+      } catch (repairErr) {
+        console.error('[Gemini Output] Falha crítica de sintaxe no JSON retornado:', repairErr);
+        throw new Error('O JSON retornado pela IA possui erros de sintaxe graves e não pôde ser reparado.');
       }
     }
 
@@ -382,8 +379,25 @@ Você deve retornar estritamente um array JSON contendo objetos com a seguinte e
         parsedJson = [];
       }
     }
+    endParse = Date.now();
 
     res.setHeader('Content-Type', 'application/json');
+
+    const totalTime = (Date.now() - startTotal) / 1000;
+    const recebimentoTime = (startUploadGemini - startTotal) / 1000;
+    const uploadGeminiTime = (endUploadGemini - startUploadGemini) / 1000;
+    const generateContentTime = (endGenerateContent - startGenerateContent) / 1000;
+    const parseTime = (endParse - startParse) / 1000;
+
+    console.log(`
+[PERFORMANCE]
+recebimento: ${recebimentoTime.toFixed(2)} seg
+upload Gemini: ${uploadGeminiTime.toFixed(2)} seg
+generateContent: ${generateContentTime.toFixed(2)} seg
+parse: ${parseTime.toFixed(2)} seg
+total: ${totalTime.toFixed(2)} seg
+`);
+
     res.json(parsedJson);
 
   } catch (error: any) {

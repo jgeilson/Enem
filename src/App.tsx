@@ -3,14 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useMemo } from 'react';
 import { 
   Atom, 
   Sparkles, 
   Flame, 
   Tv, 
   TrendingUp, 
-  Check, 
   XCircle, 
   Upload, 
   FileText,
@@ -23,20 +22,14 @@ import {
   CheckSquare,
   Square,
   FolderArchive,
-  SlidersHorizontal,
-  Info,
   RefreshCw,
   Clock,
   Layers,
   FileDown,
   AlertTriangle,
-  CheckCircle2,
-  Bot,
-  Cpu,
-  Zap
+  CheckCircle2
 } from 'lucide-react';
 import { QuestaoFísica } from './types';
-import { safeParseJson } from './utils/safeJson';
 import { 
   generateAllThemesFiles, 
   downloadLatexFile, 
@@ -44,24 +37,24 @@ import {
   generateConsolidatedLatexFile 
 } from './latexExporter';
 
-// Helper to parse and validate ENEM Physics question numbers (91 to 135)
+// Helper to parse and validate ENEM question numbers (e.g. 91 to 135)
 function parseAndValidateQuestionNumbers(input: string): { valid: boolean; numbers: number[]; normalizedText: string; error?: string } {
   const trimmed = input.trim();
   if (!trimmed) {
-    return { valid: false, numbers: [], normalizedText: '', error: 'Por favor, informe ao menos um número de questão entre 91 e 135.' };
+    return { valid: false, numbers: [], normalizedText: '', error: 'Por favor, informe ao menos um número de questão (ex: 95 ou intervalo 91 a 105).' };
   }
 
-  // Support range syntax like "91 a 135", "91-135", "91 até 135"
+  // Support range syntax like "91 a 105", "91-105", "91 até 105"
   const rangeMatch = trimmed.match(/^(\d{2,3})\s*(?:a|até|-)\s*(\d{2,3})$/i);
   if (rangeMatch) {
     const start = parseInt(rangeMatch[1], 10);
     const end = parseInt(rangeMatch[2], 10);
-    if (isNaN(start) || isNaN(end) || start > end || start < 91 || end > 135) {
+    if (isNaN(start) || isNaN(end) || start > end) {
       return { 
         valid: false, 
         numbers: [], 
         normalizedText: '',
-        error: 'O intervalo deve conter apenas valores entre 91 e 135 (ex: 91 a 135).' 
+        error: 'Intervalo inválido. O valor inicial deve ser menor que o final (ex: 91 a 105).' 
       };
     }
     const numbers: number[] = [];
@@ -72,21 +65,18 @@ function parseAndValidateQuestionNumbers(input: string): { valid: boolean; numbe
   // Split tokens by space, comma, semicolon, newline or tabs
   const rawTokens = trimmed.split(/[\s,;]+/).filter(Boolean);
   if (rawTokens.length === 0) {
-    return { valid: false, numbers: [], normalizedText: '', error: 'Por favor, informe os números das questões (separados por espaço, vírgula ou ponto e vírgula).' };
+    return { valid: false, numbers: [], normalizedText: '', error: 'Por favor, informe os números das questões.' };
   }
 
   const numbers: number[] = [];
   const invalidTokens: string[] = [];
-  const outOfRange: number[] = [];
 
   for (const token of rawTokens) {
     if (/^\d{2,3}-\d{2,3}$/.test(token)) {
       const [sStr, eStr] = token.split('-');
       const s = parseInt(sStr, 10);
       const e = parseInt(eStr, 10);
-      if (s < 91 || e > 135 || s > e) {
-        outOfRange.push(s < 91 || s > 135 ? s : e);
-      } else {
+      if (!isNaN(s) && !isNaN(e) && s <= e) {
         for (let i = s; i <= e; i++) {
           if (!numbers.includes(i)) numbers.push(i);
         }
@@ -97,8 +87,6 @@ function parseAndValidateQuestionNumbers(input: string): { valid: boolean; numbe
     const num = parseInt(token, 10);
     if (isNaN(num) || !/^\d+$/.test(token)) {
       invalidTokens.push(token);
-    } else if (num < 91 || num > 135) {
-      outOfRange.push(num);
     } else {
       if (!numbers.includes(num)) {
         numbers.push(num);
@@ -111,21 +99,12 @@ function parseAndValidateQuestionNumbers(input: string): { valid: boolean; numbe
       valid: false,
       numbers: [],
       normalizedText: '',
-      error: `Formato inválido: "${invalidTokens.join(', ')}". Use apenas números separados por espaço, vírgula (,) ou ponto e vírgula (;).`
-    };
-  }
-
-  if (outOfRange.length > 0) {
-    return {
-      valid: false,
-      numbers: [],
-      normalizedText: '',
-      error: `Os números devem estar entre 91 e 135 (caderno de Ciências da Natureza). Valores fora do intervalo: ${outOfRange.join(', ')}.`
+      error: `Formato inválido: "${invalidTokens.join(', ')}". Use números separados por vírgula ou espaço (ex: 91, 92, 93).`
     };
   }
 
   if (numbers.length === 0) {
-    return { valid: false, numbers: [], normalizedText: '', error: 'Nenhum número válido foi identificado. Insira valores entre 91 e 135.' };
+    return { valid: false, numbers: [], normalizedText: '', error: 'Nenhum número válido foi identificado.' };
   }
 
   numbers.sort((a, b) => a - b);
@@ -133,10 +112,7 @@ function parseAndValidateQuestionNumbers(input: string): { valid: boolean; numbe
 }
 
 export default function App() {
-  // Inventory of questions in memory
   const [questions, setQuestions] = useState<QuestaoFísica[]>([]);
-
-  // Track selected question IDs for LaTeX compilation
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   // Filter States
@@ -144,22 +120,20 @@ export default function App() {
   const [selectedTheme, setSelectedTheme] = useState('Todos');
   const [filterImageOnly, setFilterImageOnly] = useState<boolean>(false);
 
-  // Drag & Drop / Upload PDF Classify State
-  const [aiProvider, setAiProvider] = useState<'auto' | 'gemini' | 'groq' | 'openrouter'>('auto');
-  const [customExamText, setCustomExamText] = useState<string>('');
+  // Form & Process State
+  const [customExamText, setCustomExamText] = useState<string>('91 a 105');
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [pdfFileName, setPdfFileName] = useState<string | null>(null);
-  const [isClassifying, setIsClassifying] = useState<boolean>(false);
-  const [extractProgress, setExtractProgress] = useState<{ current: number; total: number; currentNum: number } | null>(null);
-  const cancelExtractionRef = useRef<boolean>(false);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Validation & Performance Metrics
   const [missingQuestions, setMissingQuestions] = useState<number[]>([]);
-  const [extraQuestions, setExtraQuestions] = useState<number[]>([]);
   const [invalidAlternativesQuestions, setInvalidAlternativesQuestions] = useState<number[]>([]);
   const [showSuccessValidation, setShowSuccessValidation] = useState<boolean>(false);
-  const [performanceMetrics, setPerformanceMetrics] = useState<any | null>(null);
+  const [performanceTotal, setPerformanceTotal] = useState<number | null>(null);
 
-  // LaTeX preambles & comments toggle
+  // LaTeX export options
   const [includeComments, setIncludeComments] = useState(true);
 
   // Edit Modal State
@@ -171,7 +145,6 @@ export default function App() {
   const handleDownloadPng = async (base64Data: string, numeroStr: string, questionId: string) => {
     setDownloadingPngId(questionId);
     try {
-      // Load pdfjsLib dynamically from a CDN if not already on window
       if (!(window as any).pdfjsLib) {
         await new Promise<void>((resolve, reject) => {
           const script = document.createElement('script');
@@ -186,7 +159,6 @@ export default function App() {
       const pdfjsLib = (window as any).pdfjsLib;
       pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
 
-      // Convert Base64 to binary typed array
       const binaryString = window.atob(base64Data);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
@@ -198,11 +170,10 @@ export default function App() {
       const pdfDoc = await loadingTask.promise;
       const page = await pdfDoc.getPage(1);
 
-      // Render at 3.5x scale for extremely crisp high-definition PNG output
       const viewport = page.getViewport({ scale: 3.5 });
       const canvas = document.createElement('canvas');
       const context = canvas.getContext('2d');
-      if (!context) throw new Error('Could not get canvas context');
+      if (!context) throw new Error('Não foi possível inicializar canvas');
 
       canvas.width = viewport.width;
       canvas.height = viewport.height;
@@ -213,20 +184,17 @@ export default function App() {
       }).promise;
 
       const pngUrl = canvas.toDataURL('image/png');
-
       const numMatch = numeroStr.match(/\d+/);
       const numOnly = numMatch ? numMatch[0] : numeroStr;
-      const downloadLink = document.createElement("a");
+      const downloadLink = document.createElement('a');
       downloadLink.href = pngUrl;
       downloadLink.download = `figura_questao_${numOnly}.png`;
       downloadLink.click();
     } catch (err) {
-      console.error('[PNG Converter] Falha na conversão de PDF para PNG:', err);
-      // Failover safely to downloading raw vectorized PDF
+      console.warn('[PNG Download] Erro ao converter para PNG. Baixando PDF vetorial:', err);
       const numMatch = numeroStr.match(/\d+/);
       const numOnly = numMatch ? numMatch[0] : numeroStr;
-      const linkSource = `data:application/pdf;base64,base64Data`;
-      const downloadLink = document.createElement("a");
+      const downloadLink = document.createElement('a');
       downloadLink.href = `data:application/pdf;base64,${base64Data}`;
       downloadLink.download = `figura_questao_${numOnly}.pdf`;
       downloadLink.click();
@@ -235,7 +203,6 @@ export default function App() {
     }
   };
 
-  // File selection handler
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -248,151 +215,89 @@ export default function App() {
     }
   };
 
-  const handleCancelExtraction = () => {
-    cancelExtractionRef.current = true;
-  };
-
-  // Upload and classify with AI sequentially question-by-question
-  const handleClassifySubmit = async (e: React.FormEvent) => {
+  // Submit handler: Processamento Local + Classificação IA
+  const handleExtractSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pdfFile) {
-      setErrorMessage('Por favor, selecione o arquivo PDF da prova do ENEM antes de processar.');
+      setErrorMessage('Por favor, selecione o arquivo PDF da prova do ENEM.');
       return;
     }
 
     const validation = parseAndValidateQuestionNumbers(customExamText);
     if (!validation.valid) {
-      setErrorMessage(validation.error || 'Por favor, informe números de questões válidos entre 91 e 135.');
+      setErrorMessage(validation.error || 'Informe números válidos de questão.');
       return;
     }
 
-    setIsClassifying(true);
-    cancelExtractionRef.current = false;
+    setIsProcessing(true);
     setErrorMessage(null);
     setMissingQuestions([]);
-    setExtraQuestions([]);
     setInvalidAlternativesQuestions([]);
     setShowSuccessValidation(false);
-    setPerformanceMetrics(null);
+    setPerformanceTotal(null);
 
-    const numbersToExtract = validation.numbers;
-    const total = numbersToExtract.length;
-    const missingList: number[] = [];
-    const invalidAltsList: number[] = [];
-    const newlyExtracted: QuestaoFísica[] = [];
+    const formData = new FormData();
+    formData.append('pdfFile', pdfFile);
+    formData.append('examText', validation.normalizedText);
 
-    const startTime = Date.now();
+    try {
+      const res = await fetch('/api/classify', {
+        method: 'POST',
+        body: formData,
+      });
 
-    for (let i = 0; i < total; i++) {
-      if (cancelExtractionRef.current) {
-        console.log('[Sequential Extraction] Interrompido pelo usuário.');
-        break;
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => null);
+        throw new Error(errorData?.error || `Falha no processamento (${res.status})`);
       }
 
-      const qNum = numbersToExtract[i];
-      setExtractProgress({ current: i + 1, total, currentNum: qNum });
+      const data = await res.json();
+      const extractedList: QuestaoFísica[] = data.questions || [];
+      const missingList: number[] = data.missing || [];
 
-      const formData = new FormData();
-      formData.append('pdfFile', pdfFile);
-      formData.append('examText', String(qNum));
-      formData.append('provider', aiProvider);
-
-      try {
-        let res = await fetch('/api/classify', {
-          method: 'POST',
-          body: formData,
-        });
-
-        // Retry once on transient error
-        if (!res.ok) {
-          await new Promise(r => setTimeout(r, 2000));
-          if (cancelExtractionRef.current) break;
-          res = await fetch('/api/classify', {
-            method: 'POST',
-            body: formData,
-          });
+      // Validar estrutura das alternativas
+      const invalidAltsList: number[] = [];
+      for (const q of extractedList) {
+        const hasFive = Array.isArray(q.alternativas) && q.alternativas.length === 5;
+        const allHaveText = hasFive && q.alternativas.every(a => a && a.texto && a.texto.trim().length > 0);
+        if (!hasFive || !allHaveText) {
+          const match = q.numero.match(/\d+/);
+          if (match) invalidAltsList.push(parseInt(match[0], 10));
         }
-
-        if (!res.ok) {
-          console.warn(`[Sequential Extraction] Questão ${qNum} falhou no servidor (${res.status}).`);
-          missingList.push(qNum);
-          continue;
-        }
-
-        const responseText = await res.text();
-        const classified = safeParseJson(responseText);
-
-        let rawList: any[] = [];
-        if (classified && typeof classified === 'object' && !Array.isArray(classified)) {
-          rawList = Array.isArray(classified.questions) ? classified.questions : [classified];
-        } else if (Array.isArray(classified)) {
-          rawList = classified;
-        }
-
-        if (rawList.length === 0) {
-          missingList.push(qNum);
-          continue;
-        }
-
-        for (const rawQ of rawList) {
-          const origAlts = Array.isArray(rawQ.alternativas) ? rawQ.alternativas : [];
-          const origHasExactlyFive = origAlts.length === 5;
-          const origHasCorrectLetters = origHasExactlyFive && ['A', 'B', 'C', 'D', 'E'].every((l, idx) => {
-            const alt = origAlts[idx];
-            return alt && String(alt.letra || '').toUpperCase() === l;
-          });
-          const origHasTexts = origAlts.every((alt: any) => alt && String(alt.texto || '').trim() !== '');
-
-          if (!origHasExactlyFive || !origHasCorrectLetters || !origHasTexts) {
-            invalidAltsList.push(qNum);
-          }
-
-          const letters = ['A', 'B', 'C', 'D', 'E'];
-          const normalizedAlts = letters.map((l) => {
-            const existing = origAlts.find((a: any) => a && String(a.letra || '').toUpperCase() === l);
-            return existing ? { letra: l, texto: existing.texto || '' } : { letra: l, texto: '' };
-          });
-
-          const newQ: QuestaoFísica = {
-            ...rawQ,
-            id: `custom-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-            numero: rawQ.numero || `Questão ${qNum} (ENEM)`,
-            enunciado: rawQ.enunciado || '',
-            tema: rawQ.tema ?? null,
-            subtema: rawQ.subtema || '',
-            alternativas: normalizedAlts,
-            temFigura: typeof rawQ.temFigura === 'boolean' ? rawQ.temFigura : (!!rawQ.figura || false)
-          };
-
-          newlyExtracted.push(newQ);
-
-          // Update UI immediately in real-time as each question finishes!
-          setQuestions(prev => [newQ, ...prev]);
-          setSelectedIds(prev => [newQ.id, ...prev]);
-        }
-      } catch (err) {
-        console.warn(`[Sequential Extraction] Exceção na questão ${qNum}:`, err);
-        missingList.push(qNum);
       }
-    }
 
-    const elapsedTotal = ((Date.now() - startTime) / 1000);
-    setPerformanceMetrics({ total: elapsedTotal });
-    setExtractProgress(null);
-    setIsClassifying(false);
+      // Adicionar novas questões ao inventário
+      setQuestions(prev => {
+        const existingIds = new Set(prev.map(q => q.numero));
+        const filteredNew = extractedList.filter(q => !existingIds.has(q.numero));
+        return [...filteredNew, ...prev];
+      });
 
-    if (missingList.length > 0) {
+      // Selecionar as questões recém-extraídas para exportação
+      setSelectedIds(prev => {
+        const newIds = extractedList.map(q => q.id);
+        return Array.from(new Set([...newIds, ...prev]));
+      });
+
       setMissingQuestions(missingList);
-    }
-    if (invalidAltsList.length > 0) {
       setInvalidAlternativesQuestions(invalidAltsList);
-    }
-    if (missingList.length === 0 && newlyExtracted.length > 0) {
-      setShowSuccessValidation(true);
+      if (data.performance?.total) {
+        setPerformanceTotal(data.performance.total);
+      }
+
+      if (missingList.length === 0 && invalidAltsList.length === 0 && extractedList.length > 0) {
+        setShowSuccessValidation(true);
+      }
+
+    } catch (err: any) {
+      console.error('[Extract Error]:', err);
+      setErrorMessage(err.message || 'Erro ao processar as questões do ENEM.');
+    } finally {
+      setIsProcessing(false);
     }
   };
 
-  // Bulk Operations
+  // Bulk Selection
   const handleSelectAll = () => {
     setSelectedIds(filteredQuestions.map(q => q.id));
   };
@@ -407,40 +312,30 @@ export default function App() {
     );
   };
 
-  // Inline theme edit handler
+  // Question editing
   const handleUpdateTheme = (id: string, newTheme: any) => {
-    setQuestions(prev => 
-      prev.map(q => q.id === id ? { ...q, tema: newTheme } : q)
-    );
+    setQuestions(prev => prev.map(q => q.id === id ? { ...q, tema: newTheme } : q));
   };
 
-  // Inline subtheme edit handler
   const handleUpdateSubtheme = (id: string, newSubtheme: string) => {
-    setQuestions(prev => 
-      prev.map(q => q.id === id ? { ...q, subtema: newSubtheme } : q)
-    );
+    setQuestions(prev => prev.map(q => q.id === id ? { ...q, subtema: newSubtheme } : q));
   };
 
-  // Toggle Has Image (temFigura)
   const handleToggleHasImage = (id: string) => {
-    setQuestions(prev => 
-      prev.map(q => q.id === id ? { ...q, temFigura: !q.temFigura } : q)
-    );
+    setQuestions(prev => prev.map(q => q.id === id ? { ...q, temFigura: !q.temFigura } : q));
   };
 
-  // Delete question from inventory
   const handleDeleteQuestion = (id: string) => {
     setQuestions(prev => prev.filter(q => q.id !== id));
     setSelectedIds(prev => prev.filter(item => item !== id));
   };
 
-  // Edit question text handler
   const handleSaveEdit = (edited: QuestaoFísica) => {
     setQuestions(prev => prev.map(q => q.id === edited.id ? edited : q));
     setEditingQuestion(null);
   };
 
-  // Filtered lists of questions to display in main view
+  // Filtered questions
   const filteredQuestions = useMemo(() => {
     return questions.filter(q => {
       const matchesTheme = selectedTheme === 'Todos' 
@@ -455,7 +350,6 @@ export default function App() {
     });
   }, [questions, selectedTheme, searchTerm, filterImageOnly]);
 
-  // Selected questions filtered for LaTeX downloads
   const selectedQuestionsForExport = useMemo(() => {
     return questions.filter(q => selectedIds.includes(q.id));
   }, [questions, selectedIds]);
@@ -473,60 +367,30 @@ export default function App() {
     await downloadAllThemesZip(themeFiles, 'questoes_enem_fisica_por_tema.zip', selectedQuestionsForExport);
   };
 
-  // Theme Configs (Icons & Colors Matching the Educational Guide)
-  const themeMeta: Record<string, { icon: any; color: string; bg: string; border: string }> = {
-    'Mecânica': { 
-      icon: Gauge, 
-      color: 'text-sky-600', 
-      bg: 'bg-sky-50', 
-      border: 'border-sky-100' 
-    },
-    'Eletricidade e Magnetismo': { 
-      icon: Atom, 
-      color: 'text-amber-600', 
-      bg: 'bg-amber-50', 
-      border: 'border-amber-100' 
-    },
-    'Termologia': { 
-      icon: Flame, 
-      color: 'text-rose-600', 
-      bg: 'bg-rose-50', 
-      border: 'border-rose-100' 
-    },
-    'Ondulatória': { 
-      icon: Tv, 
-      color: 'text-indigo-600', 
-      bg: 'bg-indigo-50', 
-      border: 'border-indigo-100' 
-    },
-    'Óptica': { 
-      icon: Sparkles, 
-      color: 'text-emerald-600', 
-      bg: 'bg-emerald-50', 
-      border: 'border-emerald-100' 
-    },
-    'Física Moderna': { 
-      icon: TrendingUp, 
-      color: 'text-purple-600', 
-      bg: 'bg-purple-50', 
-      border: 'border-purple-100' 
-    }
+  // Theme Configs
+  const themeMeta: Record<string, { icon: any; color: string }> = {
+    'Mecânica': { icon: Gauge, color: 'text-sky-600' },
+    'Eletricidade e Magnetismo': { icon: Atom, color: 'text-amber-600' },
+    'Termologia': { icon: Flame, color: 'text-rose-600' },
+    'Ondulatória': { icon: Tv, color: 'text-indigo-600' },
+    'Óptica': { icon: Sparkles, color: 'text-emerald-600' },
+    'Física Moderna': { icon: TrendingUp, color: 'text-purple-600' }
   };
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-900 antialiased">
       
-      {/* HEADER BAR */}
-      <header className="sticky top-0 z-40 bg-white border-b border-slate-200/80 backdrop-blur-md px-6 py-4 flex items-center justify-between shrink-0">
+      {/* HEADER */}
+      <header className="sticky top-0 z-40 bg-white border-b border-slate-200/80 backdrop-blur-md px-6 py-4 flex items-center justify-between shrink-0 shadow-2xs">
         <div className="flex items-center gap-2.5">
-          <div className="p-1.5 bg-indigo-600 text-white rounded-lg">
+          <div className="p-1.5 bg-indigo-600 text-white rounded-lg shadow-xs">
             <Atom className="h-5 w-5" />
           </div>
           <div>
             <h1 className="text-lg font-extrabold tracking-tight text-slate-900">
               Enem<span className="text-indigo-600">Física</span> LaTeX
             </h1>
-            <p className="text-[11px] text-slate-500 font-medium">Reorganizador Temático de Provas e Exportador de Exercícios</p>
+            <p className="text-[11px] text-slate-500 font-medium">Extração Local do PDF & Classificador Temático com Exportação LaTeX</p>
           </div>
         </div>
 
@@ -538,28 +402,28 @@ export default function App() {
         </div>
       </header>
 
-      {/* WORKSPACE CONTAINER */}
+      {/* WORKSPACE */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 lg:p-8 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         
-        {/* LEFT COLUMN: Controls, Uploads, Action Downloads (col-span-4) */}
+        {/* LEFT COLUMN: Controls & Upload */}
         <div className="lg:col-span-4 space-y-6">
           
-          {/* UPLOAD & IA CARD */}
+          {/* UPLOAD & LOCAL EXTRACTION CARD */}
           <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
             <div className="space-y-1">
               <h2 className="text-sm font-bold text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
                 <Upload size={16} className="text-indigo-500" />
-                <span>Carregar Nova Prova</span>
+                <span>Carregar Caderno ENEM</span>
               </h2>
               <p className="text-[11px] text-slate-500 leading-relaxed">
-                Envie o PDF da prova (ou caderno do 2º dia) para categorizar novas questões instantaneamente usando Inteligência Artificial.
+                O servidor separa o texto, as 5 alternativas e as figuras localmente no PDF, usando IA apenas para classificar o tema.
               </p>
             </div>
 
-            <form onSubmit={handleClassifySubmit} className="space-y-3.5">
-              {/* PDF Drag & Drop */}
+            <form onSubmit={handleExtractSubmit} className="space-y-3.5">
+              {/* PDF Selector */}
               <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 block">PDF Caderno 2º Dia</label>
+                <label className="text-xs font-bold text-slate-700 block">Arquivo PDF da Prova</label>
                 <div className="relative border-2 border-dashed border-slate-300 rounded-xl hover:border-indigo-500 transition-colors bg-slate-50/50 hover:bg-slate-50/20">
                   <input 
                     type="file" 
@@ -568,7 +432,7 @@ export default function App() {
                     className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                     title=""
                   />
-                  <div className="p-5 text-center space-y-2">
+                  <div className="p-4 text-center space-y-2">
                     <div className="p-2 bg-white rounded-lg shadow-xs border border-slate-200 max-w-max mx-auto text-slate-400">
                       <FileText size={20} className={pdfFileName ? 'text-indigo-600' : 'text-slate-400'} />
                     </div>
@@ -577,153 +441,50 @@ export default function App() {
                         {pdfFileName || 'Selecionar Arquivo PDF'}
                       </p>
                       <p className="text-[10px] text-slate-400 mt-0.5">
-                        {pdfFileName ? 'Clique ou arraste para trocar' : 'Arraste seu PDF aqui'}
+                        {pdfFileName ? 'Clique ou arraste para trocar o arquivo' : 'Arraste o arquivo PDF aqui'}
                       </p>
                     </div>
                   </div>
                 </div>
               </div>
 
-              {/* AI Engine / Provider Selector */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                    <Bot size={14} className="text-indigo-600" />
-                    <span>Motor de IA (Classificador)</span>
-                  </label>
-                  <span className="text-[10px] text-slate-400 font-medium">Selecione o provedor</span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setAiProvider('auto')}
-                    disabled={isClassifying}
-                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
-                      aiProvider === 'auto'
-                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
-                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-0.5">
-                      <span className="text-[11px] font-bold">Automático</span>
-                      <span className="px-1.5 py-0.2 bg-emerald-100 text-emerald-800 text-[9px] font-bold rounded">Recomendado</span>
-                    </div>
-                    <p className="text-[10px] text-slate-500 leading-tight">Gemini + Groq + OpenRouter</p>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setAiProvider('gemini')}
-                    disabled={isClassifying}
-                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
-                      aiProvider === 'gemini'
-                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
-                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-0.5">
-                      <span className="text-[11px] font-bold">Google Gemini</span>
-                      <span className="px-1.5 py-0.2 bg-blue-100 text-blue-800 text-[9px] font-bold rounded">Multimodal</span>
-                    </div>
-                    <p className="text-[10px] text-slate-500 leading-tight">Gemini 3.5 & 3.1 Flash</p>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setAiProvider('groq')}
-                    disabled={isClassifying}
-                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
-                      aiProvider === 'groq'
-                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
-                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-0.5">
-                      <span className="text-[11px] font-bold">Groq (LPU)</span>
-                      <span className="px-1.5 py-0.2 bg-orange-100 text-orange-800 text-[9px] font-bold rounded">Ultra-Rápido</span>
-                    </div>
-                    <p className="text-[10px] text-slate-500 leading-tight">Llama 3.3 70B (Meta)</p>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setAiProvider('openrouter')}
-                    disabled={isClassifying}
-                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
-                      aiProvider === 'openrouter'
-                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
-                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-0.5">
-                      <span className="text-[11px] font-bold">OpenRouter</span>
-                      <span className="px-1.5 py-0.2 bg-purple-100 text-purple-800 text-[9px] font-bold rounded">Free Tier</span>
-                    </div>
-                    <p className="text-[10px] text-slate-500 leading-tight">Llama 3 8B Open Source</p>
-                  </button>
-                </div>
-              </div>
-
               {/* Range Selector */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-slate-700 block">Questões de Ciências da Natureza</label>
-                  <span className="text-[10px] font-bold text-red-600 bg-red-50 px-1.5 py-0.5 rounded">Obrigatório *</span>
+                  <label className="text-xs font-bold text-slate-700 block">Questões a Extrair</label>
+                  <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">Rápido & Determinístico</span>
                 </div>
                 <input 
                   type="text" 
                   value={customExamText}
                   onChange={(e) => setCustomExamText(e.target.value)}
-                  placeholder="Ex: 95, 102, 115 ou intervalo 91-95"
-                  className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
-                  disabled={isClassifying}
+                  placeholder="Ex: 91 a 105 ou 95, 102, 115"
+                  className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono shadow-2xs"
+                  disabled={isProcessing}
                 />
+                <p className="text-[10px] text-slate-400">
+                  Aceita intervalos (ex: 91 a 105) ou números avulsos separados por vírgula.
+                </p>
               </div>
 
-              {/* Action Button & Live Progress */}
-              {isClassifying && extractProgress ? (
-                <div className="space-y-2.5 p-3.5 bg-indigo-50/80 border border-indigo-200 rounded-xl shadow-xs">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-bold text-indigo-950 flex items-center gap-1.5">
-                      <RefreshCw size={13} className="animate-spin text-indigo-600" />
-                      Processando Questão {extractProgress.currentNum} ({extractProgress.current} de {extractProgress.total})
-                    </span>
-                    <span className="font-bold text-indigo-700 font-mono text-[11px]">
-                      {Math.round((extractProgress.current / extractProgress.total) * 100)}%
-                    </span>
-                  </div>
-
-                  {/* Progress Track */}
-                  <div className="w-full bg-slate-200/90 rounded-full h-2 overflow-hidden">
-                    <div 
-                      className="bg-indigo-600 h-2 rounded-full transition-all duration-300 ease-out"
-                      style={{ width: `${(extractProgress.current / extractProgress.total) * 100}%` }}
-                    />
-                  </div>
-
-                  <div className="flex items-center justify-between pt-0.5">
-                    <p className="text-[10px] text-slate-500 font-medium">
-                      ✓ Questões aparecem na tela em tempo real
-                    </p>
-                    <button
-                      type="button"
-                      onClick={handleCancelExtraction}
-                      className="text-[10px] font-bold text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 px-2 py-0.5 rounded cursor-pointer transition-colors"
-                    >
-                      ⏹️ Parar
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <button
-                  type="submit"
-                  disabled={isClassifying || !pdfFile}
-                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 rounded-lg transition-all shadow-sm active:scale-95 disabled:scale-100 cursor-pointer"
-                >
-                  <Sparkles size={13} />
-                  <span>Extrair e Organizar Questões</span>
-                </button>
-              )}
+              {/* Action Button */}
+              <button
+                type="submit"
+                disabled={isProcessing || !pdfFile}
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 rounded-lg transition-all shadow-sm active:scale-95 disabled:scale-100 cursor-pointer"
+              >
+                {isProcessing ? (
+                  <>
+                    <RefreshCw size={13} className="animate-spin text-white" />
+                    <span>Processando e Classificando...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles size={13} />
+                    <span>Extrair e Organizar Questões</span>
+                  </>
+                )}
+              </button>
 
               {/* Error Alert */}
               {errorMessage && (
@@ -733,48 +494,32 @@ export default function App() {
                 </div>
               )}
 
-              {/* Extraction Validator Alerts */}
+              {/* Extraction Validation Badges */}
               {showSuccessValidation && (
                 <div className="p-3 bg-emerald-50 border border-emerald-100 text-emerald-900 rounded-lg text-[11px] leading-relaxed flex flex-col gap-1 shadow-xs">
                   <div className="flex gap-1.5 items-center font-bold text-emerald-800">
                     <CheckCircle2 size={14} className="shrink-0 text-emerald-600" />
-                    <span>Extração Perfeita (100% Válida)</span>
+                    <span>Extração 100% Válida</span>
                   </div>
                   <p className="text-slate-600 font-medium text-[10px]">
-                    Todas as questões solicitadas foram retornadas com precisão absoluta, sem nenhuma falta ou excedente.
+                    Todas as questões solicitadas foram separadas com enunciado, 5 alternativas e imagens!
                   </p>
                 </div>
               )}
 
-              {(missingQuestions.length > 0 || extraQuestions.length > 0 || invalidAlternativesQuestions.length > 0) && (
+              {(missingQuestions.length > 0 || invalidAlternativesQuestions.length > 0) && (
                 <div className="p-3 bg-amber-50 border border-amber-100 text-amber-900 rounded-lg text-[11px] leading-relaxed flex flex-col gap-2 shadow-xs">
                   <div className="flex gap-1.5 items-center font-bold text-amber-800">
                     <AlertTriangle size={14} className="shrink-0 text-amber-600" />
-                    <span>Validação: Divergência Detectada</span>
+                    <span>Atenção: Validação de Estrutura</span>
                   </div>
-                  <p className="text-slate-600 font-medium text-[10px] leading-snug">
-                    O conjunto de questões retornadas possui pendências ou não corresponde exatamente ao solicitado.
-                  </p>
                   
                   {missingQuestions.length > 0 && (
                     <div className="space-y-1">
-                      <span className="font-bold text-red-700 block text-[10px]">Faltaram (solicitadas mas não retornadas):</span>
+                      <span className="font-bold text-red-700 block text-[10px]">Não encontradas no PDF:</span>
                       <div className="flex flex-wrap gap-1">
                         {missingQuestions.map(num => (
-                          <span key={num} className="px-1.5 py-0.5 bg-red-100 text-red-800 rounded font-mono text-[10px] font-bold border border-red-200/50">
-                            Questão {num}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {extraQuestions.length > 0 && (
-                    <div className="space-y-1">
-                      <span className="font-bold text-amber-700 block text-[10px]">Excedentes (retornadas mas não solicitadas):</span>
-                      <div className="flex flex-wrap gap-1">
-                        {extraQuestions.map(num => (
-                          <span key={num} className="px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded font-mono text-[10px] font-bold border border-amber-200/50">
+                          <span key={num} className="px-1.5 py-0.5 bg-red-100 text-red-800 rounded font-mono text-[10px] font-bold">
                             Questão {num}
                           </span>
                         ))}
@@ -784,70 +529,45 @@ export default function App() {
 
                   {invalidAlternativesQuestions.length > 0 && (
                     <div className="space-y-1">
-                      <span className="font-bold text-red-700 block text-[10px]">⚠ Estrutura de Alternativas Inválida (faltando A-E ou texto em branco):</span>
+                      <span className="font-bold text-amber-800 block text-[10px]">Alternativas incompletas (necessário revisar):</span>
                       <div className="flex flex-wrap gap-1">
                         {invalidAlternativesQuestions.map(num => (
-                          <span key={num} className="px-1.5 py-0.5 bg-red-100 text-red-800 rounded font-mono text-[10px] font-bold border border-red-200/50">
+                          <span key={num} className="px-1.5 py-0.5 bg-amber-100 text-amber-900 rounded font-mono text-[10px] font-bold">
                             Questão {num}
                           </span>
                         ))}
                       </div>
                     </div>
                   )}
-
-                  <p className="text-[10px] text-slate-400 leading-normal mt-0.5">
-                    *Questões com estrutura inválida ou excedente podem ser excluídas, ou corrigidas manualmente clicando em "Editar" na lista abaixo.
-                  </p>
                 </div>
               )}
 
-              {/* Performance Metrics Card */}
-              {performanceMetrics && (
-                <div className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-lg text-[11px] space-y-1.5 shadow-2xs mt-4">
-                  <div className="flex gap-1.5 items-center font-bold text-indigo-950">
-                    <Clock size={14} className="shrink-0 text-indigo-600" />
-                    <span>Métricas de Tempo do Backend</span>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2 text-slate-600 text-[10px]">
-                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
-                      <span className="block text-slate-400 font-medium">Pré-proc. Local:</span>
-                      <span className="font-bold text-slate-800">{Number(performanceMetrics.recebimento).toFixed(2)}s</span>
-                    </div>
-                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
-                      <span className="block text-slate-400 font-medium">Upload Gemini:</span>
-                      <span className="font-bold text-slate-800">{Number(performanceMetrics.uploadGemini).toFixed(2)}s</span>
-                    </div>
-                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
-                      <span className="block text-slate-400 font-medium">IA (Gemini API):</span>
-                      <span className="font-bold text-indigo-700">{Number(performanceMetrics.generateContent).toFixed(2)}s</span>
-                    </div>
-                    <div className="bg-white/60 p-1.5 rounded border border-indigo-100/30">
-                      <span className="block text-slate-400 font-medium">Sanificar JSON:</span>
-                      <span className="font-bold text-slate-800">{Number(performanceMetrics.parse).toFixed(2)}s</span>
-                    </div>
-                  </div>
-                  <div className="pt-1 border-t border-indigo-100 flex items-center justify-between text-[10px] font-bold text-indigo-900">
-                    <span>Tempo Total Decorrido:</span>
-                    <span className="px-1.5 py-0.5 bg-indigo-600 text-white rounded">{Number(performanceMetrics.total).toFixed(2)}s</span>
-                  </div>
+              {/* Performance Indicator */}
+              {performanceTotal !== null && (
+                <div className="p-2.5 bg-slate-50 border border-slate-200/80 rounded-lg text-[11px] flex items-center justify-between text-slate-600">
+                  <span className="flex items-center gap-1 font-medium">
+                    <Clock size={13} className="text-indigo-500" />
+                    Tempo de Processamento:
+                  </span>
+                  <span className="font-bold text-slate-800 font-mono">{performanceTotal.toFixed(2)}s</span>
                 </div>
               )}
             </form>
           </section>
 
-          {/* DOWNLOAD & EXPORT OPTIONS */}
+          {/* LATEX & ZIP EXPORT */}
           <section className="bg-slate-900 rounded-2xl shadow-md p-5 text-white space-y-4">
             <div className="space-y-1">
               <h2 className="text-sm font-bold uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
                 <FileCode size={16} className="text-indigo-400" />
-                <span>Exportar LaTeX</span>
+                <span>Exportar para LaTeX</span>
               </h2>
               <p className="text-[11px] text-slate-400">
-                Gere arquivos estruturados prontos para compilar. As figuras conterão comandos de <code className="text-amber-300 font-mono">\includegraphics</code> ativos.
+                Gere arquivos estruturados com <code className="text-amber-300 font-mono">\questao</code>, <code className="text-amber-300 font-mono">\begin&#123;alternativas&#125;</code> e imagens recortadas.
               </p>
             </div>
 
-            {/* Selection Status */}
+            {/* Selection Counter */}
             <div className="p-3 bg-slate-800/80 rounded-xl border border-slate-800 flex items-center justify-between text-xs">
               <span className="font-semibold text-slate-300">Questões Selecionadas:</span>
               <span className="font-bold text-indigo-300 bg-indigo-500/10 px-2 py-0.5 rounded-md border border-indigo-500/20">
@@ -855,7 +575,7 @@ export default function App() {
               </span>
             </div>
 
-            {/* LaTeX configuration */}
+            {/* LaTeX Comments Toggle */}
             <div className="space-y-2 pt-1">
               <label className="flex items-center gap-2 text-xs font-medium text-slate-300 cursor-pointer">
                 <input 
@@ -864,11 +584,11 @@ export default function App() {
                   onChange={(e) => setIncludeComments(e.target.checked)}
                   className="rounded border-slate-700 bg-slate-800 text-indigo-500 focus:ring-0"
                 />
-                <span>Incluir comentários estruturais (% Tema / % Subtema)</span>
+                <span>Incluir comentários de tema (% Tema / % Subtema)</span>
               </label>
             </div>
 
-            {/* Download Action Buttons */}
+            {/* Export Buttons */}
             <div className="space-y-2 pt-2">
               <button
                 onClick={handleDownloadThemeZip}
@@ -876,7 +596,7 @@ export default function App() {
                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-600 rounded-xl transition-all shadow-sm active:scale-95 disabled:scale-100 cursor-pointer"
               >
                 <FolderArchive size={15} />
-                <span>Baixar ZIP (Arquivos por Tema)</span>
+                <span>Baixar ZIP (Arquivos por Tema + Figuras PNG)</span>
               </button>
 
               <button
@@ -892,18 +612,18 @@ export default function App() {
 
         </div>
 
-        {/* RIGHT COLUMN: Question Organizer Workspace (col-span-8) */}
+        {/* RIGHT COLUMN: Table & Editor */}
         <div className="lg:col-span-8 space-y-4">
           
-          {/* SEARCH & FILTERS CONTROLS */}
+          {/* SEARCH & FILTERS */}
           <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 space-y-3">
             <div className="flex flex-col sm:flex-row items-center gap-3">
               {/* Search Bar */}
               <div className="relative w-full sm:flex-1">
                 <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input 
-                  type="text"
-                  placeholder="Pesquisar questão por número, enunciado ou subtema..."
+                  type="text" 
+                  placeholder="Pesquisar por número, enunciado ou subtema..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   className="w-full pl-9 pr-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:bg-white transition-all text-slate-800"
@@ -923,7 +643,7 @@ export default function App() {
               </label>
             </div>
 
-            {/* Theme Filter badgelist */}
+            {/* Theme filter tabs */}
             <div className="flex items-center gap-1.5 flex-wrap">
               {['Todos', 'Mecânica', 'Eletricidade e Magnetismo', 'Termologia', 'Óptica', 'Ondulatória', 'Física Moderna', 'Ausentes'].map(theme => {
                 const isActive = selectedTheme === theme;
@@ -944,10 +664,10 @@ export default function App() {
             </div>
           </section>
 
-          {/* QUESTIONS INVENTORY TABLE */}
+          {/* TABLE OF QUESTIONS */}
           <section className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
             
-            {/* Table Actions Header */}
+            {/* Header controls */}
             <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0">
               <div className="flex items-center gap-2">
                 <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Questões Filtradas ({filteredQuestions.length})</h3>
@@ -979,7 +699,7 @@ export default function App() {
                 </div>
                 <div className="space-y-0.5">
                   <h4 className="text-sm font-bold text-slate-700">Nenhuma questão encontrada</h4>
-                  <p className="text-xs text-slate-500">Altere seus filtros de busca ou faça upload de um caderno do ENEM para começar.</p>
+                  <p className="text-xs text-slate-500">Envie o PDF do ENEM acima para extrair e classificar as questões automaticamente.</p>
                 </div>
               </div>
             ) : (
@@ -998,18 +718,16 @@ export default function App() {
                   <tbody className="divide-y divide-slate-100">
                     {filteredQuestions.map((q) => {
                       const isSelected = selectedIds.includes(q.id);
-                      const meta = q.tema 
-                        ? (themeMeta[q.tema] || { icon: FileText, color: 'text-slate-600', bg: 'bg-slate-50', border: 'border-slate-100' })
-                        : { icon: AlertTriangle, color: 'text-red-500 animate-pulse', bg: 'bg-red-50', border: 'border-red-100' };
-                      const ThemeIcon = meta.icon;
+                      const meta = q.tema ? themeMeta[q.tema] : null;
+                      const ThemeIcon = meta ? meta.icon : AlertTriangle;
 
                       return (
-                        <tr key={q.id} className={`hover:bg-slate-50/60 transition-colors group ${isSelected ? 'bg-indigo-50/10' : ''} ${!q.tema ? 'bg-red-50/5 hover:bg-red-50/10' : ''}`}>
+                        <tr key={q.id} className={`hover:bg-slate-50/60 transition-colors group ${isSelected ? 'bg-indigo-50/10' : ''}`}>
                           
-                          {/* Selector */}
+                          {/* Checkbox */}
                           <td className="px-5 py-3.5">
                             <input 
-                              type="checkbox"
+                              type="checkbox" 
                               checked={isSelected}
                               onChange={() => handleToggleSelect(q.id)}
                               className="rounded border-slate-300 text-indigo-600 focus:ring-0 h-4.5 w-4.5 cursor-pointer"
@@ -1017,22 +735,22 @@ export default function App() {
                             />
                           </td>
 
-                          {/* Question Name */}
+                          {/* Identifier & Snippet */}
                           <td className="px-4 py-3.5">
                             <div className="space-y-1">
                               <span className="inline-flex text-xs font-bold text-slate-800">
                                 {q.numero}
                               </span>
-                              <p className="text-[10px] text-slate-400 font-medium truncate max-w-[180px]">
+                              <p className="text-[10px] text-slate-400 font-medium truncate max-w-[200px]">
                                 {q.enunciado}
                               </p>
                             </div>
                           </td>
 
-                          {/* Theme Selector Dropdown */}
+                          {/* Theme dropdown */}
                           <td className="px-4 py-3.5">
                             <div className="flex items-center gap-1.5">
-                              <ThemeIcon size={12} className={`${meta.color} shrink-0`} />
+                              <ThemeIcon size={12} className={`${meta ? meta.color : 'text-red-500'} shrink-0`} />
                               <select
                                 value={q.tema || ''}
                                 onChange={(e) => handleUpdateTheme(q.id, e.target.value === '' ? null : e.target.value as any)}
@@ -1042,7 +760,7 @@ export default function App() {
                                     : 'text-red-700 bg-red-50 hover:bg-red-100/80 border-red-200 font-bold'
                                 }`}
                               >
-                                <option value="">⚠ Classificação Ausente</option>
+                                <option value="">⚠ Não-Física / Outra Matéria</option>
                                 {['Mecânica', 'Eletricidade e Magnetismo', 'Termologia', 'Óptica', 'Ondulatória', 'Física Moderna'].map(themeOption => (
                                   <option key={themeOption} value={themeOption}>{themeOption}</option>
                                 ))}
@@ -1050,18 +768,18 @@ export default function App() {
                             </div>
                           </td>
 
-                          {/* Subtheme text field */}
+                          {/* Subtheme input */}
                           <td className="px-4 py-3.5">
                             <input 
-                              type="text"
+                              type="text" 
                               value={q.subtema}
                               onChange={(e) => handleUpdateSubtheme(q.id, e.target.value)}
-                              placeholder="Editar subtema..."
+                              placeholder="Subtema..."
                               className="text-xs font-medium text-slate-700 bg-transparent hover:bg-slate-50 focus:bg-white border border-transparent hover:border-slate-200 focus:border-slate-300 rounded-md py-1 px-1.5 w-full focus:outline-none transition-all"
                             />
                           </td>
 
-                          {/* Image Selector toggle switch */}
+                          {/* Has Image & Crop Download */}
                           <td className="px-4 py-3.5 text-center">
                             <div className="flex flex-col items-center gap-1.5">
                               <button
@@ -1077,91 +795,32 @@ export default function App() {
                                 <span>{q.temFigura ? 'Sim' : 'Não'}</span>
                               </button>
 
-                              {q.temFigura && (
-                                <div className="flex flex-col gap-1.5 items-center">
-                                  {q.figurasBase64 && q.figurasBase64.length > 0 ? (
-                                    q.figurasBase64.map((figBase64, index) => (
-                                      <div key={index} className="flex flex-col gap-0.5 items-center border border-indigo-100/20 p-1.5 rounded-lg bg-indigo-50/20 shadow-2xs">
-                                        <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wide">Fig {index + 1}</span>
-                                        <button
-                                          type="button"
-                                          onClick={() => handleDownloadPng(figBase64, `${q.numero}_fig${index + 1}`, `${q.id}_${index}`)}
-                                          disabled={downloadingPngId === `${q.id}_${index}`}
-                                          className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
-                                          title={`Baixar figura ${index + 1} recortada (.png)`}
-                                        >
-                                          {downloadingPngId === `${q.id}_${index}` ? (
-                                            <RefreshCw size={10} className="animate-spin text-amber-500" />
-                                          ) : (
-                                            <FileDown size={10} />
-                                          )}
-                                          <span>PNG</span>
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            const numMatch = q.numero.match(/\d+/);
-                                            const numStr = numMatch ? numMatch[0] : q.id;
-                                            const linkSource = `data:application/pdf;base64,${figBase64}`;
-                                            const downloadLink = document.createElement("a");
-                                            downloadLink.href = linkSource;
-                                            downloadLink.download = `figura_questao_${numStr}_fig${index + 1}.pdf`;
-                                            downloadLink.click();
-                                          }}
-                                          className="text-[8px] font-semibold text-slate-400 hover:text-slate-600 transition-colors hover:underline cursor-pointer"
-                                          title="Baixar formato vetorial original (.pdf)"
-                                        >
-                                          (PDF)
-                                        </button>
-                                      </div>
-                                    ))
-                                  ) : q.figuraBase64 ? (
-                                    <div className="flex flex-col gap-1 items-center">
-                                      <button
-                                        type="button"
-                                        onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
-                                        disabled={downloadingPngId === q.id}
-                                        className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
-                                        title="Baixar figura recortada (.png)"
-                                      >
-                                        {downloadingPngId === q.id ? (
-                                          <RefreshCw size={10} className="animate-spin text-amber-500" />
-                                        ) : (
-                                          <FileDown size={10} />
-                                        )}
-                                        <span>Baixar PNG</span>
-                                      </button>
-                                      
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          const numMatch = q.numero.match(/\d+/);
-                                          const numStr = numMatch ? numMatch[0] : q.id;
-                                          const linkSource = `data:application/pdf;base64,${q.figuraBase64}`;
-                                          const downloadLink = document.createElement("a");
-                                          downloadLink.href = linkSource;
-                                          downloadLink.download = `figura_questao_${numStr}.pdf`;
-                                          downloadLink.click();
-                                        }}
-                                        className="text-[8px] font-semibold text-slate-400 hover:text-slate-600 transition-colors hover:underline cursor-pointer"
-                                        title="Baixar no formato vetorial original (.pdf)"
-                                      >
-                                        (Baixar PDF Vetorial)
-                                      </button>
-                                    </div>
-                                  ) : null}
-                                </div>
+                              {q.temFigura && q.figuraBase64 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
+                                  disabled={downloadingPngId === q.id}
+                                  className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                  title="Baixar figura recortada (.png)"
+                                >
+                                  {downloadingPngId === q.id ? (
+                                    <RefreshCw size={9} className="animate-spin text-amber-500" />
+                                  ) : (
+                                    <FileDown size={9} />
+                                  )}
+                                  <span>Baixar PNG</span>
+                                </button>
                               )}
                             </div>
                           </td>
 
-                          {/* Actions: Edit, Delete */}
+                          {/* Actions */}
                           <td className="px-5 py-3.5 text-right">
                             <div className="flex items-center justify-end gap-1.5">
                               <button
                                 onClick={() => setEditingQuestion(q)}
                                 className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors cursor-pointer"
-                                title="Editar texto da questão"
+                                title="Editar questão"
                               >
                                 <Edit size={14} />
                               </button>
@@ -1187,15 +846,14 @@ export default function App() {
         </div>
       </main>
 
-      {/* EDITING DIALOG MODAL */}
+      {/* EDIT MODAL */}
       {editingQuestion && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-150">
           <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-2xl w-full flex flex-col max-h-[88vh] overflow-hidden">
-            {/* Header */}
             <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2">
                 <Edit className="h-4 w-4 text-indigo-400" />
-                <h3 className="text-sm font-bold tracking-tight">Editar Conteúdo da {editingQuestion.numero}</h3>
+                <h3 className="text-sm font-bold tracking-tight">Editar {editingQuestion.numero}</h3>
               </div>
               <button 
                 onClick={() => setEditingQuestion(null)}
@@ -1205,12 +863,10 @@ export default function App() {
               </button>
             </div>
 
-            {/* Scrollable Body */}
             <div className="flex-1 overflow-y-auto p-6 space-y-4">
-              {/* Question identity */}
               <div className="grid grid-cols-2 gap-3.5">
                 <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-slate-500 uppercase">Identificador / Número</label>
+                  <label className="text-[11px] font-bold text-slate-500 uppercase">Identificador</label>
                   <input 
                     type="text" 
                     value={editingQuestion.numero}
@@ -1229,7 +885,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Enunciado text editor */}
               <div className="space-y-1">
                 <label className="text-[11px] font-bold text-slate-500 uppercase">Texto do Enunciado</label>
                 <textarea 
@@ -1240,9 +895,8 @@ export default function App() {
                 />
               </div>
 
-              {/* Alternatives editor */}
               <div className="space-y-2">
-                <label className="text-[11px] font-bold text-slate-500 uppercase block">Alternativas</label>
+                <label className="text-[11px] font-bold text-slate-500 uppercase block">5 Alternativas (A a E)</label>
                 {['A', 'B', 'C', 'D', 'E'].map((letter, idx) => {
                   const altObj = editingQuestion.alternativas[idx] || { letra: letter, texto: '' };
                   return (
@@ -1251,7 +905,7 @@ export default function App() {
                         {letter}
                       </span>
                       <input 
-                        type="text"
+                        type="text" 
                         value={altObj.texto}
                         onChange={(e) => {
                           const newAlts = [...editingQuestion.alternativas];
@@ -1267,7 +921,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Footer actions */}
             <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-2.5 shrink-0">
               <button 
                 onClick={() => setEditingQuestion(null)}

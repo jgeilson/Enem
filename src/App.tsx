@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Atom, 
   Sparkles, 
@@ -150,6 +150,8 @@ export default function App() {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [pdfFileName, setPdfFileName] = useState<string | null>(null);
   const [isClassifying, setIsClassifying] = useState<boolean>(false);
+  const [extractProgress, setExtractProgress] = useState<{ current: number; total: number; currentNum: number } | null>(null);
+  const cancelExtractionRef = useRef<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [missingQuestions, setMissingQuestions] = useState<number[]>([]);
   const [extraQuestions, setExtraQuestions] = useState<number[]>([]);
@@ -246,7 +248,11 @@ export default function App() {
     }
   };
 
-  // Upload and classify with AI
+  const handleCancelExtraction = () => {
+    cancelExtractionRef.current = true;
+  };
+
+  // Upload and classify with AI sequentially question-by-question
   const handleClassifySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pdfFile) {
@@ -261,6 +267,7 @@ export default function App() {
     }
 
     setIsClassifying(true);
+    cancelExtractionRef.current = false;
     setErrorMessage(null);
     setMissingQuestions([]);
     setExtraQuestions([]);
@@ -268,200 +275,120 @@ export default function App() {
     setShowSuccessValidation(false);
     setPerformanceMetrics(null);
 
-    const formData = new FormData();
-    formData.append('pdfFile', pdfFile);
-    formData.append('examText', validation.normalizedText);
-    formData.append('provider', aiProvider);
+    const numbersToExtract = validation.numbers;
+    const total = numbersToExtract.length;
+    const missingList: number[] = [];
+    const invalidAltsList: number[] = [];
+    const newlyExtracted: QuestaoFísica[] = [];
 
-    try {
-      let res = await fetch('/api/classify', {
-        method: 'POST',
-        body: formData,
-      });
+    const startTime = Date.now();
 
-      let responseText = await res.text();
-      let contentType = res.headers.get('content-type') || '';
-      let isHtmlResponse = contentType.includes('text/html') || responseText.trim().startsWith('<') || responseText.includes('<!doctype') || responseText.includes('<html');
+    for (let i = 0; i < total; i++) {
+      if (cancelExtractionRef.current) {
+        console.log('[Sequential Extraction] Interrompido pelo usuário.');
+        break;
+      }
 
-      // Handle server warmup (cold start) retry logic safely, without looping on other API errors
-      if (isHtmlResponse && (responseText.includes('Starting Server') || responseText.includes('warmup') || responseText.includes('Vite') || responseText.includes('<html'))) {
-        setErrorMessage('O servidor está acordando (Cold Start). Aguardando 4 segundos antes de tentar novamente...');
-        await new Promise(resolve => setTimeout(resolve, 4000));
-        
-        setErrorMessage(null);
-        res = await fetch('/api/classify', {
+      const qNum = numbersToExtract[i];
+      setExtractProgress({ current: i + 1, total, currentNum: qNum });
+
+      const formData = new FormData();
+      formData.append('pdfFile', pdfFile);
+      formData.append('examText', String(qNum));
+      formData.append('provider', aiProvider);
+
+      try {
+        let res = await fetch('/api/classify', {
           method: 'POST',
           body: formData,
         });
-        responseText = await res.text();
-        contentType = res.headers.get('content-type') || '';
-        isHtmlResponse = contentType.includes('text/html') || responseText.trim().startsWith('<') || responseText.includes('<!doctype') || responseText.includes('<html');
-      }
 
-      if (!res.ok || isHtmlResponse) {
-        let errorMsg = 'Erro ao processar com a IA.';
-
-        if (isHtmlResponse) {
-          if (res.status === 413 || responseText.includes('too large') || responseText.includes('Entity Too Large')) {
-            errorMsg = 'O arquivo PDF enviado é muito grande (excede o limite de transferência). Por favor, envie um PDF menor.';
-          } else {
-            errorMsg = 'O servidor está concluindo a inicialização. Por favor, tente clicar novamente em Extrair Questões.';
-          }
-        } else {
-          try {
-            const errData = JSON.parse(responseText);
-            errorMsg = errData.error || errorMsg;
-          } catch {
-            if (res.status === 413) {
-              errorMsg = 'O arquivo PDF enviado é muito grande. Por favor, reduza o tamanho do PDF.';
-            } else if (res.status === 429) {
-              errorMsg = 'Limite de cota de inteligência artificial temporariamente excedido. Aguarde alguns instantes ou ative o Plano Premium.';
-            } else {
-              errorMsg = `Erro no servidor (${res.status}). Por favor, tente novamente.`;
-            }
-          }
+        // Retry once on transient error
+        if (!res.ok) {
+          await new Promise(r => setTimeout(r, 2000));
+          if (cancelExtractionRef.current) break;
+          res = await fetch('/api/classify', {
+            method: 'POST',
+            body: formData,
+          });
         }
-        throw new Error(errorMsg);
-      }
 
-      let classifiedQuestions: any = null;
-      try {
-        classifiedQuestions = safeParseJson(responseText);
-      } catch (parseErr) {
-        console.error('Falha ao converter resposta da IA em JSON:', parseErr, responseText);
-        throw new Error('A resposta gerada não pôde ser interpretada como lista de questões. Por favor, tente novamente.');
-      }
-
-      let rawList: any[] = [];
-      let perf: any = null;
-
-      if (classifiedQuestions && typeof classifiedQuestions === 'object' && !Array.isArray(classifiedQuestions)) {
-        if (Array.isArray(classifiedQuestions.questions)) {
-          rawList = classifiedQuestions.questions;
-        } else {
-          rawList = [classifiedQuestions];
+        if (!res.ok) {
+          console.warn(`[Sequential Extraction] Questão ${qNum} falhou no servidor (${res.status}).`);
+          missingList.push(qNum);
+          continue;
         }
-        if (classifiedQuestions.performance) {
-          perf = classifiedQuestions.performance;
+
+        const responseText = await res.text();
+        const classified = safeParseJson(responseText);
+
+        let rawList: any[] = [];
+        if (classified && typeof classified === 'object' && !Array.isArray(classified)) {
+          rawList = Array.isArray(classified.questions) ? classified.questions : [classified];
+        } else if (Array.isArray(classified)) {
+          rawList = classified;
         }
-      } else if (Array.isArray(classifiedQuestions)) {
-        rawList = classifiedQuestions;
-      }
 
-      if (perf) {
-        setPerformanceMetrics(perf);
-        console.log(
-          `%c[PERFORMANCE] Extração Concluída!\n` +
-          `-----------------------------------\n` +
-          `• Recebimento & Local Split: ${Number(perf.recebimento).toFixed(2)}s\n` +
-          `• Upload Gemini Files API:   ${Number(perf.uploadGemini).toFixed(2)}s\n` +
-          `• Modelo (generateContent):  ${Number(perf.generateContent).toFixed(2)}s\n` +
-          `• Parse e Sanificação JSON:  ${Number(perf.parse).toFixed(2)}s\n` +
-          `• Tempo Total Decorrido:     ${Number(perf.total).toFixed(2)}s\n` +
-          `-----------------------------------`,
-          'color: #0d9488; font-weight: bold; font-size: 13px;'
-        );
-      }
+        if (rawList.length === 0) {
+          missingList.push(qNum);
+          continue;
+        }
 
-      if (rawList.length > 0) {
-        // Track structurally invalid alternatives in the incoming raw list
-        const invalidAlts: number[] = [];
-
-        const mapped = rawList.map((q: any, idx: number) => {
-          const origAlts = Array.isArray(q.alternativas) ? q.alternativas : [];
+        for (const rawQ of rawList) {
+          const origAlts = Array.isArray(rawQ.alternativas) ? rawQ.alternativas : [];
           const origHasExactlyFive = origAlts.length === 5;
-          const origHasCorrectLetters = origHasExactlyFive && ['A', 'B', 'C', 'D', 'E'].every((l, i) => {
-            const alt = origAlts[i];
+          const origHasCorrectLetters = origHasExactlyFive && ['A', 'B', 'C', 'D', 'E'].every((l, idx) => {
+            const alt = origAlts[idx];
             return alt && String(alt.letra || '').toUpperCase() === l;
           });
           const origHasTexts = origAlts.every((alt: any) => alt && String(alt.texto || '').trim() !== '');
 
-          const matchNum = String(q.numero || '').match(/\d+/);
-          const qNum = matchNum ? parseInt(matchNum[0], 10) : (idx + 1);
-
           if (!origHasExactlyFive || !origHasCorrectLetters || !origHasTexts) {
-            invalidAlts.push(qNum);
+            invalidAltsList.push(qNum);
           }
 
-          // Normalize / Heal to exactly [A, B, C, D, E] for UI rendering and safety
           const letters = ['A', 'B', 'C', 'D', 'E'];
           const normalizedAlts = letters.map((l) => {
             const existing = origAlts.find((a: any) => a && String(a.letra || '').toUpperCase() === l);
             return existing ? { letra: l, texto: existing.texto || '' } : { letra: l, texto: '' };
           });
 
-          return {
-            ...q,
-            id: `custom-${Date.now()}-${idx}`,
-            numero: q.numero || `Questão ${qNum}`,
-            enunciado: q.enunciado || '',
-            tema: q.tema ?? null,
-            subtema: q.subtema || '',
+          const newQ: QuestaoFísica = {
+            ...rawQ,
+            id: `custom-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            numero: rawQ.numero || `Questão ${qNum} (ENEM)`,
+            enunciado: rawQ.enunciado || '',
+            tema: rawQ.tema ?? null,
+            subtema: rawQ.subtema || '',
             alternativas: normalizedAlts,
-            temFigura: typeof q.temFigura === 'boolean' ? q.temFigura : (!!q.figura || false)
+            temFigura: typeof rawQ.temFigura === 'boolean' ? rawQ.temFigura : (!!rawQ.figura || false)
           };
-        });
 
-        // VERIFY EXTRACTION OF REQUESTED QUESTIONS (EXTRACTION VALIDATOR)
-        if (validation.numbers && validation.numbers.length > 0) {
-          const missing: number[] = [];
-          for (const reqNum of validation.numbers) {
-            const isFound = mapped.some((mq: any) => {
-              const numStr = String(mq.numero || '');
-              const regex = new RegExp(`\\b${reqNum}\\b`);
-              return regex.test(numStr);
-            });
-            if (!isFound) {
-              missing.push(reqNum);
-            }
-          }
-          setMissingQuestions(missing);
+          newlyExtracted.push(newQ);
 
-          const extra: number[] = [];
-          for (const mq of mapped) {
-            const numStr = String(mq.numero || '');
-            const matchNum = numStr.match(/\d+/);
-            if (matchNum) {
-              const returnedNum = parseInt(matchNum[0], 10);
-              if (returnedNum >= 91 && returnedNum <= 135 && !validation.numbers.includes(returnedNum)) {
-                if (!extra.includes(returnedNum)) {
-                  extra.push(returnedNum);
-                }
-              }
-            }
-          }
-          setExtraQuestions(extra);
-          setInvalidAlternativesQuestions(invalidAlts);
-          setShowSuccessValidation(missing.length === 0 && extra.length === 0 && invalidAlts.length === 0);
-        } else {
-          setMissingQuestions([]);
-          setExtraQuestions([]);
-          setInvalidAlternativesQuestions([]);
-          setShowSuccessValidation(false);
+          // Update UI immediately in real-time as each question finishes!
+          setQuestions(prev => [newQ, ...prev]);
+          setSelectedIds(prev => [newQ.id, ...prev]);
         }
+      } catch (err) {
+        console.warn(`[Sequential Extraction] Exceção na questão ${qNum}:`, err);
+        missingList.push(qNum);
+      }
+    }
 
-        // Adiciona novas questões ao início e seleciona-as automaticamente
-        setQuestions(prev => [...mapped, ...prev]);
-        setSelectedIds(prev => [...mapped.map(m => m.id), ...prev]);
-        
-        // Limpa formulário
-        setPdfFile(null);
-        setPdfFileName(null);
-        return;
-      } else {
-        setErrorMessage('Nenhuma questão de Física foi identificada no arquivo PDF enviado. Certifique-se de carregar o arquivo correto.');
-        return;
-      }
-    } catch (err: any) {
-      console.error(err);
-      const isFailedToFetch = String(err?.message || '').toLowerCase().includes('failed to fetch') || String(err).toLowerCase().includes('failed to fetch');
-      if (isFailedToFetch) {
-        setErrorMessage('A conexão com o servidor oscilou temporariamente ou o arquivo é muito grande. Por favor, tente clicar novamente em "Extrair Questões" para retomar.');
-      } else {
-        setErrorMessage(err?.message || 'Falha na conexão com o servidor de Inteligência Artificial.');
-      }
-    } finally {
-      setIsClassifying(false);
+    const elapsedTotal = ((Date.now() - startTime) / 1000);
+    setPerformanceMetrics({ total: elapsedTotal });
+    setExtractProgress(null);
+    setIsClassifying(false);
+
+    if (missingList.length > 0) {
+      setMissingQuestions(missingList);
+    }
+    if (invalidAltsList.length > 0) {
+      setInvalidAlternativesQuestions(invalidAltsList);
+    }
+    if (missingList.length === 0 && newlyExtracted.length > 0) {
+      setShowSuccessValidation(true);
     }
   };
 
@@ -753,24 +680,50 @@ export default function App() {
                 />
               </div>
 
-              {/* Action Button */}
-              <button
-                type="submit"
-                disabled={isClassifying || !pdfFile}
-                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 rounded-lg transition-all shadow-sm active:scale-95 disabled:scale-100 cursor-pointer"
-              >
-                {isClassifying ? (
-                  <>
-                    <RefreshCw size={13} className="animate-spin text-indigo-400" />
-                    <span>Extraindo e Categorizando...</span>
-                  </>
-                ) : (
-                  <>
-                    <Sparkles size={13} />
-                    <span>Extrair e Organizar Questões</span>
-                  </>
-                )}
-              </button>
+              {/* Action Button & Live Progress */}
+              {isClassifying && extractProgress ? (
+                <div className="space-y-2.5 p-3.5 bg-indigo-50/80 border border-indigo-200 rounded-xl shadow-xs">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-bold text-indigo-950 flex items-center gap-1.5">
+                      <RefreshCw size={13} className="animate-spin text-indigo-600" />
+                      Processando Questão {extractProgress.currentNum} ({extractProgress.current} de {extractProgress.total})
+                    </span>
+                    <span className="font-bold text-indigo-700 font-mono text-[11px]">
+                      {Math.round((extractProgress.current / extractProgress.total) * 100)}%
+                    </span>
+                  </div>
+
+                  {/* Progress Track */}
+                  <div className="w-full bg-slate-200/90 rounded-full h-2 overflow-hidden">
+                    <div 
+                      className="bg-indigo-600 h-2 rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${(extractProgress.current / extractProgress.total) * 100}%` }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between pt-0.5">
+                    <p className="text-[10px] text-slate-500 font-medium">
+                      ✓ Questões aparecem na tela em tempo real
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleCancelExtraction}
+                      className="text-[10px] font-bold text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 px-2 py-0.5 rounded cursor-pointer transition-colors"
+                    >
+                      ⏹️ Parar
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={isClassifying || !pdfFile}
+                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 rounded-lg transition-all shadow-sm active:scale-95 disabled:scale-100 cursor-pointer"
+                >
+                  <Sparkles size={13} />
+                  <span>Extrair e Organizar Questões</span>
+                </button>
+              )}
 
               {/* Error Alert */}
               {errorMessage && (

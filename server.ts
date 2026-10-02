@@ -12,7 +12,9 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import { PDFDocument } from 'pdf-lib';
-import { PDFParse } from 'pdf-parse';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { PDFParse } = require('pdf-parse');
 
 import crypto from 'crypto';
 
@@ -27,7 +29,7 @@ function calculateBufferHash(buffer: Buffer): string {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
-// Helper to extract text from a PDF page-by-page safely using the modern PDFParse class API
+// Helper to extract text from a PDF page-by-page safely using the custom PDFParse class API
 async function getPdfPagesText(fileBuffer: Buffer): Promise<string[]> {
   const parser = new PDFParse({ data: fileBuffer });
   try {
@@ -106,7 +108,6 @@ const ai = new GoogleGenAI({
 const CANDIDATE_MODELS = [
   'gemini-3.1-flash-lite',
   'gemini-3.5-flash',
-  'gemini-3.8-flash',
   'gemini-flash-latest'
 ];
 
@@ -121,7 +122,15 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPe
       try {
         console.log(`[Gemini API] Executando chamada com o modelo '${model}' (tentativa ${attempt}/${maxRetriesPerModel})...`);
         const mergedParams = { ...params, model };
-        return await aiClient.models.generateContent(mergedParams);
+        const res = await aiClient.models.generateContent(mergedParams);
+        
+        const extractedText = res?.text || res?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('') || '';
+        if (!extractedText || extractedText.trim() === '' || extractedText.trim() === '[]') {
+          console.warn(`[Gemini API] Modelo '${model}' retornou resposta vazia.`);
+          throw new Error(`Modelo '${model}' retornou resposta vazia.`);
+        }
+        
+        return res;
       } catch (error: any) {
         lastError = error;
         const errorMsg = String(error?.message || '');
@@ -162,23 +171,26 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPe
 
         console.warn(`[Gemini API] Falha no modelo '${model}' na tentativa ${attempt}: ${errorMsg || errorStr}`);
 
-        // If it's a recoverable error (503, 429, or network drop) and we have retries remaining,
-        // perform true exponential backoff with jitter on the SAME model first!
+        // If it's a 429 hard quota exhaustion (e.g. daily limit 0 or full quota exhausted), switch models immediately instead of sleeping
+        const isHardQuota = is429 && (errorMsg.includes('limit: 0') || errorMsg.includes('limit: 20') || errorMsg.includes('PerDay'));
+        if (isHardQuota) {
+          console.warn(`[Gemini API] Cota diária/por minuto esgotada no modelo '${model}'. Alternando imediatamente para o próximo modelo/fallback...`);
+          break;
+        }
+
+        // If it's a recoverable transient error (503, temporary rate limit, or network drop) and we have retries remaining:
         if (is503 || is429 || isNetworkOrReset) {
           if (attempt < maxRetriesPerModel) {
-            // Calculate base: attempt 1 -> 2.5s, attempt 2 -> 6.25s
-            const baseWaitMs = Math.pow(2.5, attempt) * 1000;
-            const jitter = Math.random() * 1000; // up to 1000ms jitter to prevent thundering herds
+            const baseWaitMs = Math.pow(1.5, attempt) * 1000;
+            const jitter = Math.random() * 500;
             const waitTimeMs = baseWaitMs + jitter;
             
-            console.log(`[Gemini API] Erro recobertável (${is503 ? '503' : is429 ? '429' : 'Rede'}). Aplicando backoff exponencial: aguardando ${Math.round(waitTimeMs)}ms antes de tentar novamente...`);
+            console.log(`[Gemini API] Erro recobertável (${is503 ? '503' : is429 ? '429' : 'Rede'}). Aguardando ${Math.round(waitTimeMs)}ms antes de tentar novamente...`);
             await new Promise(resolve => setTimeout(resolve, waitTimeMs));
           } else {
             console.warn(`[Gemini API] Limite de tentativas esgotado para o modelo '${model}'. Alternando para o próximo candidato...`);
           }
         } else {
-          // For other non-recoverable errors (e.g. prompt block, syntax, bad parameters),
-          // don't waste time retrying; switch models immediately
           console.warn(`[Gemini API] Erro não-recuperável no modelo '${model}'. Alternando de modelo...`);
           break;
         }
@@ -187,6 +199,233 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetriesPe
   }
 
   throw lastError;
+}
+
+async function getGroqLiveModels(apiKey: string): Promise<string[]> {
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { 'Authorization': `Bearer ${apiKey}` }
+    });
+    if (res.ok) {
+      const json = await res.json();
+      if (Array.isArray(json?.data)) {
+        // Filter strictly to standard general LLMs (Meta Llama, Gemma, Mixtral, Qwen, DeepSeek)
+        // and eliminate specialized/gated models that require separate terms or aren't standard text LLMs
+        const ids: string[] = json.data
+          .map((m: any) => m.id)
+          .filter((id: string) => {
+            const lower = id.toLowerCase();
+            if (
+              lower.includes('whisper') ||
+              lower.includes('tts') ||
+              lower.includes('embed') ||
+              lower.includes('guard') ||
+              lower.includes('canopy') ||
+              lower.includes('orpheus') ||
+              lower.includes('allam') ||
+              lower.includes('arabic') ||
+              lower.includes('vision') ||
+              lower.includes('audio') ||
+              lower.includes('speech') ||
+              lower.includes('specdec') ||
+              lower.includes('prompt-guard')
+            ) {
+              return false;
+            }
+            return (
+              lower.includes('llama') ||
+              lower.includes('gemma') ||
+              lower.includes('mixtral') ||
+              lower.includes('qwen') ||
+              lower.includes('deepseek')
+            );
+          });
+        
+        // Priority sorting: llama-3.1-8b-instant and llama-3.3-70b have the highest rate limits and best reliability on Groq
+        const prioritized = ids.sort((a, b) => {
+          const score = (name: string) => {
+            const lower = name.toLowerCase();
+            if (lower.includes('llama-3.1-8b-instant') || lower === 'llama-3.1-8b-instant') return 120;
+            if (lower.includes('llama-3.3-70b-versatile') || lower === 'llama-3.3-70b-versatile') return 110;
+            if (lower.includes('llama-3.1-70b-versatile') || lower === 'llama-3.1-70b-versatile') return 100;
+            if (lower.includes('llama-3.2-3b')) return 90;
+            if (lower.includes('llama-3.2-1b')) return 85;
+            if (lower.includes('llama3-70b-8192')) return 80;
+            if (lower.includes('llama3-8b-8192')) return 75;
+            if (lower.includes('gemma2-9b-it')) return 70;
+            if (lower.includes('mixtral')) return 50;
+            if (lower.includes('qwen')) return 30; // Qwen has very low output token per minute limits on Groq free tier
+            return 10;
+          };
+          return score(b) - score(a);
+        });
+
+        if (prioritized.length > 0) {
+          console.log('[Groq API] Modelos LLM compatíveis detectados na sua conta:', prioritized);
+          return prioritized;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Groq API] Não foi possível obter a lista ao vivo de modelos da Groq:', err);
+  }
+  // Safe default fallback list if endpoint is unreachable
+  return [
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "gemma2-9b-it"
+  ];
+}
+
+async function callGroqWithRetry(apiKey: string, prompt: string): Promise<string> {
+  const models = await getGroqLiveModels(apiKey);
+  let lastError: any = null;
+  
+  for (const model of models) {
+    try {
+      console.log(`[Groq API] Executando com o modelo '${model}'...`);
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: model,
+          messages: [
+            { role: 'system', content: 'Você é um assistente especialista que extrai questões do ENEM e formata estritamente em JSON válido.' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.1,
+          max_tokens: 3500,
+          response_format: { type: 'json_object' }
+        })
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        console.warn(`[Groq API] Modelo '${model}' retornou erro (${res.status}): ${errText}`);
+        lastError = new Error(`Erro na API do Groq (${res.status}): ${errText}`);
+        continue;
+      }
+
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content || '';
+      if (!content || content.trim() === '' || content.trim() === '[]') {
+        console.warn(`[Groq API] Modelo '${model}' retornou conteúdo vazio.`);
+        continue;
+      }
+      console.log(`[Groq API] Extração concluída com sucesso com o modelo '${model}'!`);
+      return content;
+    } catch (err) {
+      console.warn(`[Groq API] Exceção ao chamar modelo '${model}':`, err);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('Todos os modelos disponíveis no Groq falharam.');
+}
+
+async function getOpenRouterLiveModels(apiKey: string): Promise<string[]> {
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/models', {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://ais-pre-afoitbmb6m6fyxmrpcbhnu-213635603015.us-west2.run.app',
+        'X-Title': 'ENEM LaTeX Classifier'
+      }
+    });
+    if (res.ok) {
+      const json = await res.json();
+      if (Array.isArray(json?.data)) {
+        // Collect active free models first
+        const freeModels = json.data
+          .filter((m: any) => {
+            const isFree = m.id?.endsWith(':free') || (m.pricing && m.pricing.prompt === '0' && m.pricing.completion === '0');
+            const isText = !m.id?.includes('whisper') && !m.id?.includes('embed') && !m.id?.includes('image');
+            return isFree && isText;
+          })
+          .map((m: any) => m.id);
+
+        // General popular models if user has credits
+        const standardModels = json.data
+          .filter((m: any) => !m.id?.includes('whisper') && !m.id?.includes('embed'))
+          .map((m: any) => m.id);
+
+        const allCandidates = Array.from(new Set([...freeModels, ...standardModels]));
+
+        if (allCandidates.length > 0) {
+          console.log('[OpenRouter API] Modelos ao vivo detectados na API:', freeModels.slice(0, 8));
+          return allCandidates;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[OpenRouter API] Não foi possível consultar a lista ao vivo de modelos do OpenRouter:', err);
+  }
+
+  // Safe fallback list
+  return [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "meta-llama/llama-3.2-1b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "deepseek/deepseek-r1:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.1-8b-instruct",
+    "meta-llama/llama-3.3-70b-instruct"
+  ];
+}
+
+async function callOpenRouter(apiKey: string, prompt: string): Promise<string> {
+  const models = await getOpenRouterLiveModels(apiKey);
+  let lastError: any = null;
+  
+  // Try up to 8 candidate models to prevent long hanging loops
+  const candidateSlice = models.slice(0, 10);
+
+  for (const model of candidateSlice) {
+    try {
+      console.log(`[OpenRouter API] Executando com o modelo '${model}'...`);
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+          'HTTP-Referer': 'https://ais-pre-afoitbmb6m6fyxmrpcbhnu-213635603015.us-west2.run.app',
+          'X-Title': 'ENEM LaTeX Classifier'
+        },
+        body: JSON.stringify({
+          model: model,
+          messages: [
+            { role: 'system', content: 'Você é um assistente especialista que extrai questões do ENEM e formata estritamente em JSON válido.' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.1
+        })
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        console.warn(`[OpenRouter API] Modelo '${model}' retornou erro (${res.status}): ${errText}`);
+        lastError = new Error(`Erro na API do OpenRouter (${res.status}): ${errText}`);
+        continue;
+      }
+
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content || '';
+      console.log(`[OpenRouter API] Extração concluída com sucesso com o modelo '${model}'!`);
+      return content;
+    } catch (err) {
+      console.warn(`[OpenRouter API] Exceção ao chamar modelo '${model}':`, err);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('Todos os modelos disponíveis no OpenRouter falharam.');
 }
 
 /// Helper to upload files to the Gemini Files API with automatic exponential backoff for transient errors
@@ -265,38 +504,163 @@ async function uploadFileWithRetry(aiClient: any, filePath: string, maxRetries =
   throw lastError;
 }
 
-// Classify endpoint
-app.post('/api/classify', upload.single('pdfFile'), async (req, res) => {
-  const { examText } = req.body;
-  const file = req.file;
-
-  if (!file) {
-    return res.status(400).json({ error: 'Nenhum arquivo PDF da prova do ENEM foi fornecido para análise.' });
+function normalizeQuestionsArray(parsed: any): any[] {
+  if (Array.isArray(parsed)) {
+    return parsed;
   }
-  if (!examText || examText.trim() === '') {
-    try {
-      await fs.promises.unlink(file.path);
-    } catch {}
-    return res.status(400).json({ error: 'Por favor, informe ao menos uma questão a ser extraída (ex: 95, 112).' });
+  if (parsed && Array.isArray(parsed.questions)) {
+    return parsed.questions;
+  }
+  if (parsed && typeof parsed === 'object') {
+    return [parsed];
+  }
+  return [];
+}
+
+/**
+ * Ultra-robust 5-stage JSON parser and repair engine.
+ * Specifically resilient against unescaped LaTeX backslashes, unescaped quotes,
+ * truncated outputs, and markdown code fences.
+ */
+function parseAndRepairJson(rawInput: string): any[] {
+  if (!rawInput || typeof rawInput !== 'string' || rawInput.trim() === '' || rawInput.trim() === '[]') {
+    return [];
   }
 
-  let uploadedRemoteFile: any = null;
-  let splitTempFilePath: string | null = null;
-  let orderedPages: string[] = [];
+  let cleaned = rawInput.trim();
+  
+  // 1. Remove markdown backticks if any
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch && codeBlockMatch[1]) {
+    cleaned = codeBlockMatch[1].trim();
+  } else {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  }
 
-  const startTotal = Date.now();
-  let startUploadGemini = 0;
-  let endUploadGemini = 0;
-  let startGenerateContent = 0;
-  let endGenerateContent = 0;
-  let startParse = 0;
-  let endParse = 0;
+  if (!cleaned || cleaned === '' || cleaned === '[]') {
+    return [];
+  }
 
+  // 2. Find outermost bracket bounds [ ... ] or object bounds { ... }
+  const firstBracket = cleaned.indexOf('[');
+  const firstBrace = cleaned.indexOf('{');
+  
+  let startIndex = -1;
+  let endIndex = -1;
+  
+  if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
+    startIndex = firstBracket;
+    endIndex = cleaned.lastIndexOf(']');
+  } else if (firstBrace !== -1) {
+    startIndex = firstBrace;
+    endIndex = cleaned.lastIndexOf('}');
+  }
+  
+  if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
+    cleaned = cleaned.substring(startIndex, endIndex + 1);
+  }
+
+  // Stage 1: Standard zero-overhead JSON.parse
   try {
-    const finalPrompt = `Extraia e classifique as questões solicitadas do documento ENEM: [${examText}].
+    const res = JSON.parse(cleaned);
+    return normalizeQuestionsArray(res);
+  } catch (err1) {
+    // Continue to next stages
+  }
+
+  // Stage 2: jsonrepair standard pass
+  try {
+    const repaired = jsonrepair(cleaned);
+    const res = JSON.parse(repaired);
+    return normalizeQuestionsArray(res);
+  } catch (err2) {
+    console.warn('[JSON Repair Stage 2] jsonrepair inicial falhou:', err2);
+  }
+
+  // Stage 3: Escape lone backslashes that are not valid JSON escape sequences
+  // In JSON, valid escapes are \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+  try {
+    const escapedBackslashes = cleaned.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, '\\\\');
+    try {
+      const res = JSON.parse(escapedBackslashes);
+      return normalizeQuestionsArray(res);
+    } catch {
+      const repaired = jsonrepair(escapedBackslashes);
+      const res = JSON.parse(repaired);
+      return normalizeQuestionsArray(res);
+    }
+  } catch (err3) {
+    console.warn('[JSON Repair Stage 3] Correção de barras invertidas LaTeX falhou:', err3);
+  }
+
+  // Stage 4: If truncated at the end, attempt to close open strings, objects and array
+  try {
+    let truncated = cleaned;
+    const openBrackets = (truncated.match(/\[/g) || []).length;
+    const closeBrackets = (truncated.match(/\]/g) || []).length;
+    const openBraces = (truncated.match(/\{/g) || []).length;
+    const closeBraces = (truncated.match(/\}/g) || []).length;
+    
+    // Add missing closing quotes if odd number of quotes
+    const quoteMatches = truncated.match(/"/g) || [];
+    if (quoteMatches.length % 2 !== 0) {
+      truncated += '"';
+    }
+    for (let i = 0; i < openBraces - closeBraces; i++) {
+      truncated += '}';
+    }
+    for (let i = 0; i < openBrackets - closeBrackets; i++) {
+      truncated += ']';
+    }
+    const repaired = jsonrepair(truncated);
+    const res = JSON.parse(repaired);
+    return normalizeQuestionsArray(res);
+  } catch (err4) {
+    console.warn('[JSON Repair Stage 4] Tentativa de fechamento de JSON truncado falhou:', err4);
+  }
+
+  // Stage 5: Regex-based question block extraction!
+  // If the array as a whole has syntax flaws, extract each individual question object `{ "numero": ... }`
+  try {
+    console.warn('[JSON Repair Stage 5] Tentando recuperação cirúrgica por blocos de questões individuais...');
+    const questions: any[] = [];
+    
+    const objectRegex = /\{\s*"numero"\s*:\s*"(?:[^"\\]|\\.)*"[\s\S]*?(?=\}\s*,\s*\{\s*"numero"|\}\s*\]|\}\s*$)/g;
+    let match;
+    while ((match = objectRegex.exec(cleaned)) !== null) {
+      let block = match[0].trim();
+      if (!block.endsWith('}')) {
+        block += '}';
+      }
+      try {
+        const item = JSON.parse(block);
+        questions.push(item);
+      } catch {
+        try {
+          const item = JSON.parse(jsonrepair(block));
+          questions.push(item);
+        } catch {}
+      }
+    }
+    
+    if (questions.length > 0) {
+      console.log(`[JSON Repair Stage 5] Sucesso! ${questions.length} questão(ões) recuperadas do JSON!`);
+      return questions;
+    }
+  } catch (err5) {
+    console.error('[JSON Repair Stage 5] Falha na extração por regex:', err5);
+  }
+
+  // Log snippet for diagnostics if all stages fail
+  console.error('[JSON Repair Diagnostic] Início do texto bruto recebido da IA:\n', cleaned.slice(0, 500));
+  throw new Error('O JSON retornado pela IA possui erros de formatação graves e não pôde ser reparado.');
+}
+
+function buildPromptForQuestions(questionsText: string): string {
+  return `Extraia e classifique as questões solicitadas do documento ENEM: [${questionsText}].
 
 DIRETRIZES DE EXTRAÇÃO:
-- Localize e transcreva EXCLUSIVAMENTE as questões com os números: ${examText}. Ignore todo o restante do documento PDF.
+- Localize e transcreva EXCLUSIVAMENTE as questões com os números: ${questionsText}. Ignore todo o restante do documento PDF.
 - Preserve com fidelidade absoluta o enunciado original: transcreva todo o texto integralmente, sem simplificações, sem resumos, mantendo rigorosamente todos os valores numéricos, algarismos significativos (ex: mantenha "0,50 m" exatamente e NUNCA simplifique ou altere para "0,5 m"), notações científicas, fórmulas e unidades de medida exatamente como aparecem no PDF original.
 - Para cada questão, extraia todas as 5 alternativas (A, B, C, D, E), preservando o texto original de cada uma delas com fidelidade total e absoluta.
 - Identifique se a questão possui qualquer figura, tabela complexa (representada por imagem), gráfico, diagrama ou ilustração original associada e defina o campo "temFigura" correspondente (true ou false).
@@ -315,9 +679,9 @@ RECONHECIMENTO DE FIGURAS COM COORDENADAS (BBOX):
 - REQUISITO DE PRECISÃO ABSOLUTA: Seja extremamente rigoroso, milimétrico e cirúrgico ao calcular a bbox. O retângulo deve englobar estritamente a ilustração física e suas legendas imediatas. NÃO inclua textos de enunciado, tabelas de dados ou partes de questões adjacentes (acima ou abaixo). Se o retângulo ficar muito grande ou deslocado, o corte incluirá textos indesejados. Ajuste a coordenada "y" e a "height" para ficarem coladas nas bordas da ilustração.
 
 REPRODUÇÃO DE TABELAS, LISTAS E FÓRMULAS (ESSENCIAL):
-- Se a questão contiver tabelas (dados em linhas e colunas), você DEVE transcrevê-las obrigatoriamente usando o ambiente LaTeX "tabular" (ex: \begin{tabular}{|c|c|} \hline Cabeçalho 1 & Cabeçalho 2 \\ \hline Dado 1 & Dado 2 \\ \hline \end{tabular}) diretamente embutido no texto do campo "enunciado", garantindo que ela compile perfeitamente e fique legível.
-- Se a questão contiver listas de itens, tópicos ou enumerações no corpo do enunciado, você DEVE formatá-las obrigatoriamente usando os ambientes LaTeX nativos "itemize" ou "enumerate" (ex: \begin{itemize} \item Item 1 \item Item 2 \end{itemize}).
-- Escreva todas as fórmulas físicas, variables ou números com expoentes usando a notação matemática nativa do LaTeX (ex: $E = m \cdot c^2$, $2 \cdot 10^3\text{ J}$, $5\text{ m/s}$) para que a renderização no arquivo .tex compilado seja profissional e legível.
+- Se a questão contiver tabelas (dados em linhas e colunas), você DEVE transcrevê-las obrigatoriamente usando o ambiente LaTeX "tabular" (ex: \\begin{tabular}{|c|c|} \\hline Cabeçalho 1 & Cabeçalho 2 \\\\ \\hline Dado 1 & Dado 2 \\\\ \\hline \\end{tabular}) diretamente embutido no texto do campo "enunciado", garantindo que ela compile perfeitamente e fique legível.
+- Se a questão contiver listas de itens, tópicos ou enumerações no corpo do enunciado, você DEVE formatá-las obrigatoriamente usando os ambientes LaTeX nativos "itemize" ou "enumerate" (ex: \\begin{itemize} \\item Item 1 \\item Item 2 \\end{itemize}).
+- Escreva todas as fórmulas físicas, variables ou números com expoentes usando a notação matemática nativa do LaTeX (ex: $E = m \\cdot c^2$, $2 \\cdot 10^3\\text{ J}$, $5\\text{ m/s}$) para que a renderização no arquivo .tex compilado seja profissional e legível.
 
 DIRETRIZES DE CLASSIFICAÇÃO:
 - Classifique cada questão individualmente em uma das 6 temáticas oficiais do ENEM: Mecânica, Eletricidade e Magnetismo, Termologia, Óptica, Ondulatória, Física Moderna. Caso a questão não pertença a nenhuma destas áreas ou não seja identificável, defina o campo "tema" como null.
@@ -348,286 +712,379 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
       }
     ]
   }
-]`;
+]
 
-    // Read full PDF buffer
-    const fullPdfBuffer = await fs.promises.readFile(file.path);
-    const pdfHash = calculateBufferHash(fullPdfBuffer);
+DIRETRIZES CRÍTICAS DE FORMATAÇÃO DO JSON:
+- No JSON, barras invertidas do LaTeX em enunciados ou fórmulas DEVEM ser duplicadas (ex: \\\\begin{tabular}, \\\\frac{a}{b}, \\\\alpha, \\\\times, \\\\hline).
+- NUNCA utilize aspas duplas desprotegidas no meio de um texto ou enunciado. Se o enunciado citar palavras ou expressões entre aspas no original (ex: o termo "força"), converta-as para aspas simples (o termo 'força') ou escape com \\\\".
+- Retorne estritamente o array JSON sem delimitadores markdown extras fora do formato.`;
+}
 
-    // Local Search & Precise Page Selection Optimization
-    const requestedNumbers = examText.split(',').map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => !isNaN(n));
-    let finalPdfPath = file.path;
-    let isSplitUsed = false;
-    let indexesArray: number[] = [];
+function getPagesForQuestions(numbers: number[], orderedPages: string[]): number[] {
+  const pageIndexesToExtract = new Set<number>();
+  for (const reqNum of numbers) {
+    const regexQuestao = new RegExp(`(?:QUESTÃO|Questão|Questao)[\\s\\S]{0,15}\\b${reqNum}\\b`, 'i');
+    const regexStartLine = new RegExp(`(?:^|\\n|\\r)[ \t]*\\b${reqNum}\\b\\s*[\\.\\-–—\\)]`, 'i');
+    const regexStandalone = new RegExp(`(?<!\\d)${reqNum}(?!\\d)`, 'g');
 
-    if (requestedNumbers.length > 0) {
-      try {
-        orderedPages = [];
-        if (pdfPageTextCache.has(pdfHash)) {
-          console.log(`[Cache Hit] Utilizando textos das páginas indexados do cache local (Hash: ${pdfHash}).`);
-          orderedPages = pdfPageTextCache.get(pdfHash)!;
-        } else {
-          console.log(`[Cache Miss] Analisando texto das páginas do PDF localmente (Hash: ${pdfHash})...`);
-          orderedPages = await getPdfPagesText(fullPdfBuffer);
-          pdfPageTextCache.set(pdfHash, orderedPages);
-          console.log(`[Cache Map] Textos salvos no cache local para reuso em futuras requisições.`);
-          
-          // Keep cache size under control (e.g., max 50 PDFs cached in memory)
-          if (pdfPageTextCache.size > 50) {
-            const firstKey = pdfPageTextCache.keys().next().value;
-            if (firstKey) pdfPageTextCache.delete(firstKey);
-          }
-        }
+    let bestPageIdx = -1;
+    let maxScore = -1;
 
-        const pageIndexesToExtract = new Set<number>();
-        const pageScores = new Map<number, Map<number, number>>(); // map of reqNum -> Map of pageIdx -> score
+    for (let i = 0; i < orderedPages.length; i++) {
+      const pageText = orderedPages[i] || '';
+      let score = 0;
+      if (regexQuestao.test(pageText)) score += 100;
+      if (regexStartLine.test(pageText)) score += 50;
+      const matches = pageText.match(regexStandalone);
+      if (matches && matches.length > 0) score += Math.min(matches.length * 3, 15);
 
-        for (const reqNum of requestedNumbers) {
-          const scoresForNum = new Map<number, number>();
-          
-          // Regex A: "Questão ... 95" (allowing up to 15 characters of any spacing/metadata in between, including newlines)
-          const regexQuestao = new RegExp(`(?:QUESTÃO|Questão|Questao)[\\s\\S]{0,15}\\b${reqNum}\\b`, 'i');
-          
-          // Regex B: "95" at the start of a line or after a newline with a common delimiter
-          const regexStartLine = new RegExp(`(?:^|\\n|\\r)[ \t]*\\b${reqNum}\\b\\s*[\\.\\-–—\\)]`, 'i');
-          
-          // Regex C: standalone number "95" (not part of decimal or date like 1995)
-          const regexStandalone = new RegExp(`(?<!\\d)${reqNum}(?!\\d)`, 'g');
-
-          for (let i = 0; i < orderedPages.length; i++) {
-            const pageText = orderedPages[i] || '';
-            let score = 0;
-            
-            if (regexQuestao.test(pageText)) {
-              score += 100;
-            }
-            if (regexStartLine.test(pageText)) {
-              score += 50;
-            }
-            
-            // Count standalone occurrences
-            const matches = pageText.match(regexStandalone);
-            if (matches && matches.length > 0) {
-              // Add a small score per standalone occurrence, up to 15 points
-              score += Math.min(matches.length * 3, 15);
-            }
-            
-            if (score > 0) {
-              scoresForNum.set(i, score);
-            }
-          }
-          
-          pageScores.set(reqNum, scoresForNum);
-        }
-
-        for (const reqNum of requestedNumbers) {
-          const scores = pageScores.get(reqNum);
-          if (scores && scores.size > 0) {
-            // Find the page index with the maximum score
-            let bestPageIdx = -1;
-            let maxScore = -1;
-            for (const [pageIdx, score] of scores.entries()) {
-              if (score > maxScore) {
-                maxScore = score;
-                bestPageIdx = pageIdx;
-              }
-            }
-            
-            if (bestPageIdx !== -1 && maxScore >= 12) {
-              pageIndexesToExtract.add(bestPageIdx);
-              // Include the next page as well, in case the question flows to the next page!
-              if (bestPageIdx + 1 < orderedPages.length) {
-                pageIndexesToExtract.add(bestPageIdx + 1);
-              }
-            }
-          }
-        }
-
-        if (pageIndexesToExtract.size > 0) {
-          indexesArray = Array.from(pageIndexesToExtract);
-          console.log(`[Local Optimization] Questões localizadas nas páginas (1-indexed): ${indexesArray.map(p => p + 1).join(', ')}. Extraindo apenas estas páginas...`);
-          const splitPdfBuffer = await extractSpecificPages(fullPdfBuffer, indexesArray);
-          
-          splitTempFilePath = path.join('/tmp', `split_${Date.now()}_${Math.random().toString(36).slice(2)}.pdf`);
-          await fs.promises.writeFile(splitTempFilePath, splitPdfBuffer);
-          finalPdfPath = splitTempFilePath;
-          isSplitUsed = true;
-        } else {
-          console.log('[Local Optimization] Nenhuma página correspondente foi localizada pelo texto.');
-          const srcDoc = await PDFDocument.load(fullPdfBuffer);
-          const totalPages = srcDoc.getPageCount();
-          if (totalPages > 15) {
-            return res.status(422).json({
-              error: `Não foi possível localizar o texto das questões (${examText}) no arquivo enviado de ${totalPages} páginas. O PDF pode ser escaneado (imagem) ou está em formato incompatível. Por favor, envie um PDF do ENEM que possua texto pesquisável (selecionável).`
-            });
-          }
-          console.log('[Local Optimization] PDF pequeno (< 15 páginas). Prosseguindo com o PDF completo como fallback seguro.');
-        }
-      } catch (splitErr) {
-        console.warn('[Local Optimization] Falha ao tentar dividir o PDF localmente, utilizando o PDF completo como fallback seguro:', splitErr);
+      if (score > maxScore) {
+        maxScore = score;
+        bestPageIdx = i;
       }
     }
 
-    startUploadGemini = Date.now();
-    const contents: any[] = [];
-    
-    // Use Gemini Files API for reliable upload of dense PDF documents.
-    // This prevents ECONNRESET and fetch failed caused by massive inline base64 payloads in JSON bodies.
-    let useFilesApi = false;
-    try {
-      uploadedRemoteFile = await uploadFileWithRetry(ai, finalPdfPath);
-      if (uploadedRemoteFile && uploadedRemoteFile.uri) {
-        useFilesApi = true;
+    if (bestPageIdx !== -1 && maxScore >= 12) {
+      pageIndexesToExtract.add(bestPageIdx);
+      if (bestPageIdx + 1 < orderedPages.length) {
+        pageIndexesToExtract.add(bestPageIdx + 1);
+      }
+    }
+  }
+
+  return Array.from(pageIndexesToExtract).sort((a, b) => a - b);
+}
+
+async function extractSingleChunk({
+  chunkNumbers,
+  fullPdfBuffer,
+  orderedPages,
+  provider,
+  ai
+}: {
+  chunkNumbers: number[];
+  fullPdfBuffer: Buffer;
+  orderedPages: string[];
+  provider: string;
+  ai: any;
+}): Promise<{ questions: any[]; usedProvider: string }> {
+  const chunkText = chunkNumbers.join(', ');
+  const chunkIndexesArray = getPagesForQuestions(chunkNumbers, orderedPages);
+  
+  let finalPdfPath: string | null = null;
+  let splitTempFilePath: string | null = null;
+  let isSplitUsed = false;
+
+  if (chunkIndexesArray.length > 0) {
+    console.log(`[Batch Engine] Chunk [${chunkText}] localizado nas páginas: ${chunkIndexesArray.map(p => p + 1).join(', ')}`);
+    const splitPdfBuffer = await extractSpecificPages(fullPdfBuffer, chunkIndexesArray);
+    splitTempFilePath = path.join('/tmp', `chunk_${Date.now()}_${Math.random().toString(36).slice(2)}.pdf`);
+    await fs.promises.writeFile(splitTempFilePath, splitPdfBuffer);
+    finalPdfPath = splitTempFilePath;
+    isSplitUsed = true;
+  } else {
+    // If specific pages not found via text, write full buffer to temp
+    splitTempFilePath = path.join('/tmp', `full_${Date.now()}_${Math.random().toString(36).slice(2)}.pdf`);
+    await fs.promises.writeFile(splitTempFilePath, fullPdfBuffer);
+    finalPdfPath = splitTempFilePath;
+  }
+
+  const finalPrompt = buildPromptForQuestions(chunkText);
+  const textContext = chunkIndexesArray.length > 0 
+    ? chunkIndexesArray.map(idx => `--- PÁGINA ${idx + 1} ---\n${orderedPages[idx] || ''}`).join('\n\n')
+    : orderedPages.map((page, idx) => `--- PÁGINA ${idx + 1} ---\n${page}`).join('\n\n');
+
+  const textPromptForFallback = `Abaixo estão os textos das páginas relevantes extraídos do PDF da prova do ENEM.
+Por favor, processe esses textos, extraia as questões especificadas (${chunkText}) e classifique-as.
+
+REQUISITO EXTREMAMENTE IMPORTANTE:
+- Retorne obrigatoriamente e estritamente apenas um array JSON válido. Sem explicações ou introduções fora do formato.
+- IDENTIFICAÇÃO DE IMAGENS/FIGURAS: Se o enunciado ou texto da questão fizer referência a qualquer imagem, figura, gráfico, tirinha, charge, tabela ou esquema (ex: "conforme a figura", "no gráfico", "na tirinha", "esquema abaixo", "a imagem ilustra"), você DEVE marcar "temFigura": true e preencher o array "figuras" com [{"tipo": "imagem", "pagina": 0}]. Se não houver figura, marque "temFigura": false e "figuras": [].
+- O formato do JSON deve ser exatamente:
+[
+  {
+    "numero": "Questão XX (ENEM YYYY)",
+    "enunciado": "Enunciado transcrito da questão em LaTeX...",
+    "tema": "Mecânica",
+    "subtema": "Cinemática",
+    "alternativas": [
+      { "letra": "A", "texto": "Texto original..." }
+    ],
+    "temFigura": true,
+    "figuras": [
+      { "tipo": "imagem", "pagina": 0 }
+    ]
+  }
+]
+
+TEXTO DO PDF:
+${textContext}
+
+INSTRUÇÕES ORIGINAIS DE EXTRAÇÃO:
+${finalPrompt}`;
+
+  let rawText = '';
+  let usedProvider = provider === 'groq' ? 'Groq' : provider === 'openrouter' ? 'OpenRouter' : 'Gemini';
+  let uploadedRemoteFile: any = null;
+
+  try {
+    if (provider === 'groq') {
+      const groqKey = process.env.GROQ_API_KEY;
+      if (!groqKey) throw new Error('GROQ_API_KEY não configurada.');
+      rawText = await callGroqWithRetry(groqKey, textPromptForFallback);
+    } else if (provider === 'openrouter') {
+      const openRouterKey = process.env.OPENROUTER_API_KEY;
+      if (!openRouterKey) throw new Error('OPENROUTER_API_KEY não configurada.');
+      rawText = await callOpenRouter(openRouterKey, textPromptForFallback);
+    } else {
+      // Gemini / Auto
+      const contents: any[] = [];
+      let useFilesApi = false;
+      try {
+        uploadedRemoteFile = await uploadFileWithRetry(ai, finalPdfPath);
+        if (uploadedRemoteFile && uploadedRemoteFile.uri) {
+          useFilesApi = true;
+          contents.push({
+            fileData: {
+              fileUri: uploadedRemoteFile.uri,
+              mimeType: uploadedRemoteFile.mimeType || "application/pdf"
+            }
+          });
+        }
+      } catch (uploadErr) {
+        console.warn('[Gemini Files API] Fallback inlineData para o chunk...', uploadErr);
+      }
+
+      if (!useFilesApi) {
+        const fileBuffer = await fs.promises.readFile(finalPdfPath);
         contents.push({
-          fileData: {
-            fileUri: uploadedRemoteFile.uri,
-            mimeType: uploadedRemoteFile.mimeType || "application/pdf"
+          inlineData: {
+            mimeType: "application/pdf",
+            data: fileBuffer.toString('base64')
           }
         });
       }
-    } catch (uploadErr) {
-      console.warn('[Gemini Files API] Falha persistente no upload do arquivo após retries:', uploadErr);
-      
-      // Determine if it is safe to fall back to inlineData based on file size
-      let fileSize = 0;
+
+      contents.push({ text: finalPrompt });
+
       try {
-        const stats = await fs.promises.stat(finalPdfPath);
-        fileSize = stats.size;
-      } catch (statErr) {
-        console.warn('[Gemini Files API] Falha ao ler estatísticas de tamanho do arquivo:', statErr);
-      }
-      
-      const MAX_SAFE_INLINE_SIZE = 1.5 * 1024 * 1024; // 1.5MB
-      
-      if (fileSize > 0 && fileSize <= MAX_SAFE_INLINE_SIZE) {
-        console.log(`[Gemini Files API] Tamanho do arquivo (${(fileSize / 1024).toFixed(1)} KB) é menor que 1.5MB. Prosseguindo com fallback seguro de inlineData.`);
-      } else {
-        console.error(`[Gemini Files API] Tamanho do arquivo (${(fileSize / 1024 / 1024).toFixed(2)} MB) é muito grande para envio inline seguro. Propagando erro.`);
-        throw new Error(`Falha ao carregar o arquivo PDF para a API do Gemini. Detalhes: ${uploadErr instanceof Error ? uploadErr.message : uploadErr}`);
-      }
-    }
-
-    if (!useFilesApi) {
-      const fileBuffer = await fs.promises.readFile(finalPdfPath);
-      contents.push({
-        inlineData: {
-          mimeType: "application/pdf",
-          data: fileBuffer.toString('base64')
-        }
-      });
-    }
-    endUploadGemini = Date.now();
-    
-    contents.push({ text: finalPrompt });
-
-    startGenerateContent = Date.now();
-    const response: any = await generateContentWithRetry(ai, {
-      model: "gemini-3.8-flash",
-      contents: contents,
-      config: {
-        maxOutputTokens: 8192,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              numero: { type: Type.STRING },
-              enunciado: { type: Type.STRING },
-              tema: { type: Type.STRING },
-              subtema: { type: Type.STRING },
-              alternativas: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    letra: { type: Type.STRING },
-                    texto: { type: Type.STRING }
-                  },
-                  required: ["letra", "texto"]
-                }
-              },
-              temFigura: { type: Type.BOOLEAN },
-              figuras: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    tipo: { type: Type.STRING },
-                    pagina: { type: Type.INTEGER },
-                    bbox: {
+        const response: any = await generateContentWithRetry(ai, {
+          contents: contents,
+          config: {
+            maxOutputTokens: 8192,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  numero: { type: Type.STRING },
+                  enunciado: { type: Type.STRING },
+                  tema: { type: Type.STRING },
+                  subtema: { type: Type.STRING },
+                  alternativas: {
+                    type: Type.ARRAY,
+                    items: {
                       type: Type.OBJECT,
                       properties: {
-                        x: { type: Type.NUMBER },
-                        y: { type: Type.NUMBER },
-                        width: { type: Type.NUMBER },
-                        height: { type: Type.NUMBER }
+                        letra: { type: Type.STRING },
+                        texto: { type: Type.STRING }
                       },
-                      required: ["x", "y", "width", "height"]
+                      required: ["letra", "texto"]
                     }
                   },
-                  required: ["tipo", "pagina", "bbox"]
-                }
+                  temFigura: { type: Type.BOOLEAN },
+                  figuras: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        tipo: { type: Type.STRING },
+                        pagina: { type: Type.INTEGER },
+                        bbox: {
+                          type: Type.OBJECT,
+                          properties: {
+                            x: { type: Type.NUMBER },
+                            y: { type: Type.NUMBER },
+                            width: { type: Type.NUMBER },
+                            height: { type: Type.NUMBER }
+                          },
+                          required: ["x", "y", "width", "height"]
+                        }
+                      },
+                      required: ["tipo", "pagina", "bbox"]
+                    }
+                  }
+                },
+                required: ["numero", "enunciado", "subtema", "alternativas", "temFigura"]
               }
-            },
-            required: ["numero", "enunciado", "subtema", "alternativas", "temFigura"]
+            }
           }
+        });
+        rawText = response.text || response.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('') || '';
+        if (!rawText || rawText.trim() === '' || rawText.trim() === '[]') {
+          throw new Error('Gemini retornou resposta vazia.');
+        }
+      } catch (geminiErr) {
+        console.warn('[Fallback System] Fallback no chunk para Groq / OpenRouter...', geminiErr);
+        const groqKey = process.env.GROQ_API_KEY;
+        const openRouterKey = process.env.OPENROUTER_API_KEY;
+        if (groqKey) {
+          rawText = await callGroqWithRetry(groqKey, textPromptForFallback);
+          usedProvider = 'Groq';
+        } else if (openRouterKey) {
+          rawText = await callOpenRouter(openRouterKey, textPromptForFallback);
+          usedProvider = 'OpenRouter';
+        } else {
+          throw geminiErr;
         }
       }
-    });
-    endGenerateContent = Date.now();
-
-    startParse = Date.now();
-    let rawText = response.text || '[]';
-    rawText = rawText.trim();
-    if (rawText.startsWith('```')) {
-      rawText = rawText.replace(/^```(?:json)?\s*/i, '');
-      rawText = rawText.replace(/\s*```$/, '');
-      rawText = rawText.trim();
     }
+  } finally {
+    if (splitTempFilePath) {
+      try { await fs.promises.unlink(splitTempFilePath); } catch {}
+    }
+    if (uploadedRemoteFile && uploadedRemoteFile.name) {
+      try { await ai.files.delete({ name: uploadedRemoteFile.name }); } catch {}
+    }
+  }
 
-    let parsedJson: any = [];
+  const parsed = parseAndRepairJson(rawText);
+
+  // Map relative figure page index back to original PDF page index
+  for (const q of parsed) {
+    if (q.figuras && Array.isArray(q.figuras)) {
+      for (const fig of q.figuras) {
+        if (typeof fig.pagina === 'number' && chunkIndexesArray.length > 0 && fig.pagina < chunkIndexesArray.length) {
+          fig._originalPageIdx = chunkIndexesArray[fig.pagina];
+        }
+      }
+    }
+  }
+
+  return { questions: parsed, usedProvider };
+}
+
+// Classify endpoint
+app.post('/api/classify', upload.single('pdfFile'), async (req, res) => {
+  const { examText, provider = 'auto' } = req.body;
+  const file = req.file;
+
+  if (!file) {
+    return res.status(400).json({ error: 'Nenhum arquivo PDF da prova do ENEM foi fornecido para análise.' });
+  }
+  if (!examText || examText.trim() === '') {
     try {
-      parsedJson = JSON.parse(rawText);
-    } catch {
-      try {
-        console.warn('[Gemini Output] Falha no parse inicial do JSON. Tentando reparação com jsonrepair...');
-        const repaired = jsonrepair(rawText);
-        parsedJson = JSON.parse(repaired);
-      } catch (repairErr) {
-        console.error('[Gemini Output] Falha crítica de sintaxe no JSON retornado:', repairErr);
-        throw new Error('O JSON retornado pela IA possui erros de sintaxe graves e não pôde ser reparado.');
+      await fs.promises.unlink(file.path);
+    } catch {}
+    return res.status(400).json({ error: 'Por favor, informe ao menos uma questão a ser extraída (ex: 95, 112).' });
+  }
+
+  let orderedPages: string[] = [];
+  const startTotal = Date.now();
+
+  try {
+    const fullPdfBuffer = await fs.promises.readFile(file.path);
+    const pdfHash = calculateBufferHash(fullPdfBuffer);
+
+    // Get and cache ordered page texts
+    if (pdfPageTextCache.has(pdfHash)) {
+      orderedPages = pdfPageTextCache.get(pdfHash)!;
+    } else {
+      orderedPages = await getPdfPagesText(fullPdfBuffer);
+      pdfPageTextCache.set(pdfHash, orderedPages);
+      if (pdfPageTextCache.size > 50) {
+        const firstKey = pdfPageTextCache.keys().next().value;
+        if (firstKey) pdfPageTextCache.delete(firstKey);
       }
     }
 
-    // Ensure array structure
-    if (!Array.isArray(parsedJson)) {
-      if (parsedJson && Array.isArray((parsedJson as any).questions)) {
-        parsedJson = (parsedJson as any).questions;
-      } else if (parsedJson && typeof parsedJson === 'object') {
-        parsedJson = [parsedJson];
-      } else {
-        parsedJson = [];
+    // Cleanly parse all requested numbers (e.g. "91, 92, 93 ...")
+    const requestedNumbers = examText
+      .split(',')
+      .map((s: string) => parseInt(s.trim(), 10))
+      .filter((n: number) => !isNaN(n));
+
+    if (requestedNumbers.length === 0) {
+      return res.status(400).json({ error: 'Nenhum número válido de questão foi informado.' });
+    }
+
+    // High-performance batching: Divide requested questions into small chunks of 3 questions each
+    const CHUNK_SIZE = 3;
+    const chunks: number[][] = [];
+    for (let i = 0; i < requestedNumbers.length; i += CHUNK_SIZE) {
+      chunks.push(requestedNumbers.slice(i, i + CHUNK_SIZE));
+    }
+
+    console.log(`[Batch Engine] Processando ${requestedNumbers.length} questões divididas em ${chunks.length} bloco(s) de até ${CHUNK_SIZE} questões.`);
+
+    const allQuestions: any[] = [];
+    let detectedProvider = 'Gemini';
+
+    // Process chunks concurrently in pairs of 2 to optimize throughput without exceeding rate limits
+    for (let i = 0; i < chunks.length; i += 2) {
+      const currentBatch = chunks.slice(i, i + 2);
+      const results = await Promise.all(
+        currentBatch.map(chunk =>
+          extractSingleChunk({
+            chunkNumbers: chunk,
+            fullPdfBuffer,
+            orderedPages,
+            provider,
+            ai
+          })
+        )
+      );
+
+      for (const r of results) {
+        if (r.usedProvider) detectedProvider = r.usedProvider;
+        allQuestions.push(...r.questions);
       }
     }
-    // Process each question to crop figures using pdf-lib if figures and bbox are provided
-    // Load the source PDF document EXACTLY ONCE to avoid heavy repetitive loading overhead
+
+    // Deduplicate and sort questions numerically
+    const seenNums = new Set<string>();
+    const deduplicatedQuestions: any[] = [];
+
+    for (const q of allQuestions) {
+      const match = String(q.numero || '').match(/\d+/);
+      const numKey = match ? match[0] : (q.numero || Math.random().toString());
+      if (!seenNums.has(numKey)) {
+        seenNums.add(numKey);
+        deduplicatedQuestions.push(q);
+      }
+    }
+
+    deduplicatedQuestions.sort((a, b) => {
+      const numA = parseInt(String(a.numero || '').match(/\d+/)?.[0] || '0', 10);
+      const numB = parseInt(String(b.numero || '').match(/\d+/)?.[0] || '0', 10);
+      return numA - numB;
+    });
+
+    let parsedJson = deduplicatedQuestions;
+
+    // Load source PDF document once for figure cropping
     let sourcePdfDoc: PDFDocument | null = null;
     try {
       sourcePdfDoc = await PDFDocument.load(fullPdfBuffer);
     } catch (loadErr) {
-      console.error('[Figure Cropper] Falha ao carregar o documento PDF de origem para extração:', loadErr);
+      console.error('[Figure Cropper] Falha ao carregar o PDF de origem:', loadErr);
     }
 
     if (sourcePdfDoc) {
       for (const q of parsedJson) {
+        const textHasFigureCue = /(?:figura|gr[aá]fico|tabela|esquema|tirinha|charge|imagem|ilustra[çc][aã]o|ilustrad[ao]|veja o desenho)/i.test(q.enunciado || '');
+        if (textHasFigureCue && (!q.temFigura || !Array.isArray(q.figuras) || q.figuras.length === 0)) {
+          q.temFigura = true;
+          q.figuras = [{ tipo: 'imagem', pagina: 0, bbox: { x: 0.05, y: 0.05, width: 0.9, height: 0.85 } }];
+        }
+
         if (q.temFigura && Array.isArray(q.figuras) && q.figuras.length > 0) {
           try {
             const matchNum = String(q.numero || '').match(/\d+/);
             const reqNum = matchNum ? parseInt(matchNum[0], 10) : null;
-            
+
             if (reqNum) {
-              // Find which page index this question is on (0-indexed) using ultra-robust regex matching
               const regex1 = new RegExp(`(?:QUESTÃO|Questão|Questao)\\s*(?:de\\s+)?(?:n[º°o]\\s*)?\\s*[:-–—]?\\s*${reqNum}\\b`, 'i');
               const regex2 = new RegExp(`(?:^|\\n|\\r)\\s*${reqNum}\\s*[\\.\\-–—]\\s*`, 'i');
               let foundPageIdx = -1;
@@ -640,15 +1097,11 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
               }
 
               if (foundPageIdx !== -1) {
-                q.figurasBase64 = []; // initialize array to store multiple cropped figures
-                
-                // Process ALL figures in the figures array
+                q.figurasBase64 = [];
                 for (let figIdx = 0; figIdx < q.figuras.length; figIdx++) {
                   const fig = q.figuras[figIdx];
-                  if (fig && fig.bbox) {
-                    const bbox = fig.bbox;
-                    
-                    // Normalise coordinates dynamically if they are on a [0, 1000] integer scale
+                  const bbox = fig?.bbox || { x: 0.05, y: 0.05, width: 0.9, height: 0.85 };
+                  if (bbox) {
                     let normX = bbox.x;
                     let normY = bbox.y;
                     let normW = bbox.width;
@@ -661,22 +1114,12 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                       normH = normH / 1000.0;
                     }
 
-                    // Determine the exact original page index for this figure
-                    let originalPageIdx = foundPageIdx; // fallback to question start page
-                    if (typeof fig.pagina === 'number' && fig.pagina >= 0) {
-                      if (isSplitUsed && Array.isArray(indexesArray) && fig.pagina < indexesArray.length) {
-                        originalPageIdx = indexesArray[fig.pagina];
-                        console.log(`[Figure Cropper] Mapeamento de página para Questão ${reqNum}: página relativa ${fig.pagina} -> original ${originalPageIdx + 1}`);
-                      } else {
-                        originalPageIdx = fig.pagina;
-                        console.log(`[Figure Cropper] Mapeamento direto de página para Questão ${reqNum}: página original ${originalPageIdx + 1}`);
-                      }
+                    let originalPageIdx = (typeof fig?._originalPageIdx === 'number') ? fig._originalPageIdx : foundPageIdx;
+                    if (originalPageIdx < 0 || originalPageIdx >= sourcePdfDoc.getPageCount()) {
+                      originalPageIdx = foundPageIdx;
                     }
 
-                    // Create the cropped destination document
                     const croppedDoc = await PDFDocument.create();
-                    
-                    // Copy a clean, unmutated page from sourcePdfDoc to the destination document
                     const [copiedPage] = await croppedDoc.copyPages(sourcePdfDoc, [originalPageIdx]);
                     croppedDoc.addPage(copiedPage);
 
@@ -684,99 +1127,53 @@ Sua resposta deve ser estritamente um array JSON estruturado conforme o seguinte
                     const cropBox = copiedPage.getCropBox() || mediaBox;
                     const viewBox = cropBox;
 
-                    // Calculate rotation if any
-                    let rotationAngle = 0;
-                    try {
-                      rotationAngle = copiedPage.getRotation().angle || 0;
-                    } catch {}
-
                     const rawCropX = viewBox.x + (normX * viewBox.width);
-                    // Since Gemini's Y coordinate starts from the top of the viewBox, and PDF starts from bottom
                     const rawCropY = viewBox.y + viewBox.height - (normY * viewBox.height) - (normH * viewBox.height);
                     const rawCropWidth = normW * viewBox.width;
                     const rawCropHeight = normH * viewBox.height;
 
-                    // Apply 1cm (28.35 PDF points) margin around the figure on all sides for safe clipping,
-                    // clamping strictly to the boundaries of the page reference box (viewBox) to keep it legal.
-                    const margin = 28.35; 
+                    const margin = 28.35; // 1cm margin
                     const cropX = Math.max(viewBox.x, rawCropX - margin);
                     const cropY = Math.max(viewBox.y, rawCropY - margin);
 
-                    // Re-calculate width expanding left by the exact delta and right by 1cm margin
                     let cropWidth = rawCropWidth + (rawCropX - cropX) + margin;
                     if (cropX + cropWidth > viewBox.x + viewBox.width) {
                       cropWidth = viewBox.x + viewBox.width - cropX;
                     }
 
-                    // Re-calculate height expanding bottom by the exact delta and top by 1cm margin
                     let cropHeight = rawCropHeight + (rawCropY - cropY) + margin;
                     if (cropY + cropHeight > viewBox.y + viewBox.height) {
                       cropHeight = viewBox.y + viewBox.height - cropY;
                     }
 
-                    console.log(`
-[Figure Diagnostic] Questão ${reqNum} | Figura ${figIdx + 1}/${q.figuras.length}
-Página Original: ${originalPageIdx + 1}
-Rotação da Página: ${rotationAngle}°
-MediaBox: x=${mediaBox.x.toFixed(2)}, y=${mediaBox.y.toFixed(2)}, w=${mediaBox.width.toFixed(2)}, h=${mediaBox.height.toFixed(2)}
-CropBox: x=${cropBox.x.toFixed(2)}, y=${cropBox.y.toFixed(2)}, w=${cropBox.width.toFixed(2)}, h=${cropBox.height.toFixed(2)}
-Gemini BBOX: x=${normX.toFixed(4)}, y=${normY.toFixed(4)}, w=${normW.toFixed(4)}, h=${normH.toFixed(4)}
-Calculado Crop (com margem de 1cm): x=${cropX.toFixed(2)}, y=${cropY.toFixed(2)}, w=${cropWidth.toFixed(2)}, h=${cropHeight.toFixed(2)}
-`);
-
-                    // Directly adjust MediaBox and CropBox to define the cropped visible region,
-                    // without modifying or translating the vector content coordinates.
                     copiedPage.setMediaBox(cropX, cropY, cropWidth, cropHeight);
                     copiedPage.setCropBox(cropX, cropY, cropWidth, cropHeight);
 
                     const croppedPdfBytes = await croppedDoc.save();
                     const figBase64 = Buffer.from(croppedPdfBytes).toString('base64');
-                    
                     q.figurasBase64.push(figBase64);
-                    
-                    // Populate single-fig default for backwards compatibility
+
                     if (figIdx === 0) {
                       q.figuraBase64 = figBase64;
                     }
-                    
-                    console.log(`[Figure Cropper] Sucesso ao cortar figura ${figIdx + 1}/${q.figuras.length} para Questão ${reqNum} na página ${originalPageIdx + 1}`);
                   }
                 }
               }
             }
           } catch (cropErr) {
-            console.error('[Figure Cropper] Falha ao cortar a figura da questão:', cropErr);
+            console.error('[Figure Cropper] Falha ao cortar a figura:', cropErr);
           }
         }
       }
     }
 
-    endParse = Date.now();
+    const totalTime = (Date.now() - startTotal) / 1000;
+    console.log(`[Batch Engine] Concluído com sucesso! ${parsedJson.length} questões extraídas em ${totalTime.toFixed(2)}s.`);
 
     res.setHeader('Content-Type', 'application/json');
-
-    const totalTime = (Date.now() - startTotal) / 1000;
-    const recebimentoTime = (startUploadGemini - startTotal) / 1000;
-    const uploadGeminiTime = (endUploadGemini - startUploadGemini) / 1000;
-    const generateContentTime = (endGenerateContent - startGenerateContent) / 1000;
-    const parseTime = (endParse - startParse) / 1000;
-
-    console.log(`
-[PERFORMANCE]
-recebimento: ${recebimentoTime.toFixed(2)} seg
-upload Gemini: ${uploadGeminiTime.toFixed(2)} seg
-generateContent: ${generateContentTime.toFixed(2)} seg
-parse: ${parseTime.toFixed(2)} seg
-total: ${totalTime.toFixed(2)} seg
-`);
-
     res.json({
       questions: parsedJson,
       performance: {
-        recebimento: recebimentoTime,
-        uploadGemini: uploadGeminiTime,
-        generateContent: generateContentTime,
-        parse: parseTime,
         total: totalTime
       }
     });
@@ -805,14 +1202,6 @@ total: ${totalTime.toFixed(2)} seg
     // Clean up local original temp file
     if (file && file.path) {
       fs.promises.unlink(file.path).catch(() => {});
-    }
-    // Clean up local split temp file
-    if (splitTempFilePath) {
-      fs.promises.unlink(splitTempFilePath).catch(() => {});
-    }
-    // Clean up remote Gemini Files API storage
-    if (uploadedRemoteFile && uploadedRemoteFile.name) {
-      ai.files.delete({ name: uploadedRemoteFile.name }).catch(() => {});
     }
   }
 });

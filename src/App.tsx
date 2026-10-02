@@ -30,7 +30,10 @@ import {
   Layers,
   FileDown,
   AlertTriangle,
-  CheckCircle2
+  CheckCircle2,
+  Bot,
+  Cpu,
+  Zap
 } from 'lucide-react';
 import { QuestaoFísica } from './types';
 import { safeParseJson } from './utils/safeJson';
@@ -142,6 +145,7 @@ export default function App() {
   const [filterImageOnly, setFilterImageOnly] = useState<boolean>(false);
 
   // Drag & Drop / Upload PDF Classify State
+  const [aiProvider, setAiProvider] = useState<'auto' | 'gemini' | 'groq' | 'openrouter'>('auto');
   const [customExamText, setCustomExamText] = useState<string>('');
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [pdfFileName, setPdfFileName] = useState<string | null>(null);
@@ -267,6 +271,7 @@ export default function App() {
     const formData = new FormData();
     formData.append('pdfFile', pdfFile);
     formData.append('examText', validation.normalizedText);
+    formData.append('provider', aiProvider);
 
     try {
       let res = await fetch('/api/classify', {
@@ -649,6 +654,86 @@ export default function App() {
                       </p>
                     </div>
                   </div>
+                </div>
+              </div>
+
+              {/* AI Engine / Provider Selector */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                    <Bot size={14} className="text-indigo-600" />
+                    <span>Motor de IA (Classificador)</span>
+                  </label>
+                  <span className="text-[10px] text-slate-400 font-medium">Selecione o provedor</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAiProvider('auto')}
+                    disabled={isClassifying}
+                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
+                      aiProvider === 'auto'
+                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
+                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className="text-[11px] font-bold">Automático</span>
+                      <span className="px-1.5 py-0.2 bg-emerald-100 text-emerald-800 text-[9px] font-bold rounded">Recomendado</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight">Gemini + Groq + OpenRouter</p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setAiProvider('gemini')}
+                    disabled={isClassifying}
+                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
+                      aiProvider === 'gemini'
+                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
+                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className="text-[11px] font-bold">Google Gemini</span>
+                      <span className="px-1.5 py-0.2 bg-blue-100 text-blue-800 text-[9px] font-bold rounded">Multimodal</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight">Gemini 3.5 & 3.1 Flash</p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setAiProvider('groq')}
+                    disabled={isClassifying}
+                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
+                      aiProvider === 'groq'
+                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
+                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className="text-[11px] font-bold">Groq (LPU)</span>
+                      <span className="px-1.5 py-0.2 bg-orange-100 text-orange-800 text-[9px] font-bold rounded">Ultra-Rápido</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight">Llama 3.3 70B (Meta)</p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setAiProvider('openrouter')}
+                    disabled={isClassifying}
+                    className={`p-2 rounded-lg border text-left transition-all cursor-pointer ${
+                      aiProvider === 'openrouter'
+                        ? 'bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 text-indigo-950 shadow-xs'
+                        : 'bg-white border-slate-200 hover:border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className="text-[11px] font-bold">OpenRouter</span>
+                      <span className="px-1.5 py-0.2 bg-purple-100 text-purple-800 text-[9px] font-bold rounded">Free Tier</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight">Llama 3 8B Open Source</p>
+                  </button>
                 </div>
               </div>
 

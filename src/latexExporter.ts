@@ -100,6 +100,9 @@ export function formatToLatex(text: string): string {
   // Evitar duplicações de cifrões caso ocorram ($$...$$)
   res = res.replace(/\${2,}/g, '$');
 
+  // Auto-format Roman numeral statements (I., II., III., IV., V., VI.) into clean list items with bold labels
+  res = res.replace(/(?:^|\n)\s*(I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s+/g, '\n\\textbf{$1.} ');
+
   // Format tables (\begin{tabular} ... \end{tabular}) to have clean newlines and indentation around them
   res = res.replace(/\\begin\{tabular\}/g, '\n\n\\begin{tabular}');
   res = res.replace(/\\end\{tabular\}/g, '\\end{tabular}\n\n');

@@ -246,14 +246,39 @@ export default function App() {
         body: formData,
       });
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => null);
-        throw new Error(errorData?.error || `Falha no processamento (${res.status})`);
+      const responseText = await res.text();
+      let data: any = null;
+      try {
+        data = JSON.parse(responseText);
+      } catch (parseErr: any) {
+        console.error('[Extract Response Parse Error]:', responseText ? responseText.slice(0, 300) : '<empty>', parseErr);
+        const trimmed = (responseText || '').trim();
+        if (trimmed.startsWith('<')) {
+          throw new Error('O servidor está reiniciando ou indisponível temporariamente. Por favor, aguarde 2 segundos e clique novamente.');
+        }
+        if (parseErr?.message?.includes('end of JSON') || parseErr?.message?.includes('Unexpected end')) {
+          throw new Error('A resposta do servidor foi interrompida antes do término. Tente selecionar menos questões por vez.');
+        }
+        throw new Error(
+          res.ok
+            ? 'O servidor retornou uma resposta não reconhecida. Por favor, tente novamente.'
+            : `Servidor indisponível temporariamente (${res.status}). Aguarde alguns instantes e tente novamente.`
+        );
       }
 
-      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || `Falha no processamento (${res.status})`);
+      }
+
       const extractedList: QuestaoFísica[] = data.questions || [];
       const missingList: number[] = data.missing || [];
+
+      // Garantir compatibilidade com figuraBase64
+      for (const q of extractedList) {
+        if (!q.figuraBase64 && q.figurasBase64 && q.figurasBase64.length > 0) {
+          q.figuraBase64 = q.figurasBase64[0];
+        }
+      }
 
       // Validar estrutura das alternativas
       const invalidAltsList: number[] = [];
@@ -738,9 +763,22 @@ export default function App() {
                           {/* Identifier & Snippet */}
                           <td className="px-4 py-3.5">
                             <div className="space-y-1">
-                              <span className="inline-flex text-xs font-bold text-slate-800">
-                                {q.numero}
-                              </span>
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="inline-flex text-xs font-bold text-slate-800">
+                                  {q.numero}
+                                </span>
+                                {(!q.temCincoAlternativas || !q.alternativas || q.alternativas.length !== 5 || q.alternativas.some(a => !a.texto || !a.texto.trim())) && (
+                                  <button
+                                    onClick={() => setEditingQuestion(q)}
+                                    type="button"
+                                    title="Alternativas incompletas. Clique para revisar e editar."
+                                    className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-100 text-amber-800 hover:bg-amber-200 transition-colors inline-flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <AlertTriangle size={9} className="text-amber-600 shrink-0" />
+                                    <span>Revisar Alternativas</span>
+                                  </button>
+                                )}
+                              </div>
                               <p className="text-[10px] text-slate-400 font-medium truncate max-w-[200px]">
                                 {q.enunciado}
                               </p>
@@ -760,7 +798,7 @@ export default function App() {
                                     : 'text-red-700 bg-red-50 hover:bg-red-100/80 border-red-200 font-bold'
                                 }`}
                               >
-                                <option value="">⚠ Não-Física / Outra Matéria</option>
+                                <option value="">⚠ Não classificado (Ausente)</option>
                                 {['Mecânica', 'Eletricidade e Magnetismo', 'Termologia', 'Óptica', 'Ondulatória', 'Física Moderna'].map(themeOption => (
                                   <option key={themeOption} value={themeOption}>{themeOption}</option>
                                 ))}
@@ -795,21 +833,48 @@ export default function App() {
                                 <span>{q.temFigura ? 'Sim' : 'Não'}</span>
                               </button>
 
-                              {q.temFigura && q.figuraBase64 && (
-                                <button
-                                  type="button"
-                                  onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
-                                  disabled={downloadingPngId === q.id}
-                                  className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
-                                  title="Baixar figura recortada (.png)"
-                                >
-                                  {downloadingPngId === q.id ? (
-                                    <RefreshCw size={9} className="animate-spin text-amber-500" />
-                                  ) : (
-                                    <FileDown size={9} />
-                                  )}
-                                  <span>Baixar PNG</span>
-                                </button>
+                              {q.temFigura && (
+                                <div className="flex flex-col gap-1 items-center">
+                                  {q.figurasBase64 && q.figurasBase64.length > 1 ? (
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDownloadPng(q.figurasBase64![0], `${q.numero}_coluna`, q.id)}
+                                        disabled={downloadingPngId === q.id}
+                                        className="inline-flex items-center gap-0.5 text-[9px] font-bold text-amber-700 hover:text-amber-900 bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                        title="Baixar Abordagem 1: Recorte da Coluna (.png)"
+                                      >
+                                        <FileDown size={9} />
+                                        <span>Coluna</span>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDownloadPng(q.figurasBase64![1], `${q.numero}_focalizado`, q.id)}
+                                        disabled={downloadingPngId === q.id}
+                                        className="inline-flex items-center gap-0.5 text-[9px] font-bold text-amber-700 hover:text-amber-900 bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                        title="Baixar Abordagem 2: Recorte Focalizado (.png)"
+                                      >
+                                        <FileDown size={9} />
+                                        <span>Foco</span>
+                                      </button>
+                                    </div>
+                                  ) : q.figuraBase64 ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDownloadPng(q.figuraBase64!, q.numero, q.id)}
+                                      disabled={downloadingPngId === q.id}
+                                      className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-700 hover:text-amber-900 transition-colors bg-amber-50 hover:bg-amber-100 disabled:opacity-55 px-1.5 py-0.5 rounded border border-amber-200/50 cursor-pointer"
+                                      title="Baixar figura (.png)"
+                                    >
+                                      {downloadingPngId === q.id ? (
+                                        <RefreshCw size={9} className="animate-spin text-amber-500" />
+                                      ) : (
+                                        <FileDown size={9} />
+                                      )}
+                                      <span>Baixar PNG</span>
+                                    </button>
+                                  ) : null}
+                                </div>
                               )}
                             </div>
                           </td>
@@ -919,6 +984,82 @@ export default function App() {
                   );
                 })}
               </div>
+
+              {/* Figuras Produzidas (Abordagem 1, Abordagem 2 e Fallback) */}
+              {editingQuestion.temFigura && (
+                <div className="space-y-2 pt-3 border-t border-slate-200/80">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] font-bold text-slate-500 uppercase flex items-center gap-1.5">
+                      <ImageIcon size={13} className="text-amber-500" />
+                      <span>Imagens Produzidas ({editingQuestion.figurasBase64?.length || 1})</span>
+                    </label>
+                    <span className="text-[10px] text-slate-400 font-medium">
+                      Abordagem 1 (Coluna) & Abordagem 2 (Focalizado)
+                    </span>
+                  </div>
+
+                  {editingQuestion.figurasBase64 && editingQuestion.figurasBase64.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {editingQuestion.figurasBase64.map((base64, cIdx) => {
+                        const isPrimary = editingQuestion.figuraBase64 === base64 || (!editingQuestion.figuraBase64 && cIdx === 0);
+                        return (
+                          <div 
+                            key={cIdx} 
+                            className={`p-3 rounded-xl border flex flex-col justify-between gap-2.5 transition-all ${
+                              isPrimary 
+                                ? 'border-indigo-500 bg-indigo-50/20 ring-1 ring-indigo-500/20 shadow-2xs' 
+                                : 'border-slate-200 bg-slate-50/50 hover:border-slate-300'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-[11px] font-bold text-slate-700">
+                                {cIdx === 0 ? 'Opção 1: Recorte da Coluna' : 'Opção 2: Recorte Focalizado'}
+                              </span>
+                              {isPrimary && (
+                                <span className="px-1.5 py-0.5 rounded text-[9px] font-extrabold bg-indigo-600 text-white">
+                                  Usar no LaTeX
+                                </span>
+                              )}
+                            </div>
+                            
+                            <p className="text-[10px] text-slate-500 leading-tight">
+                              {cIdx === 0 
+                                ? 'Delimita a coluna da questão sem pegar a outra coluna do ENEM.' 
+                                : 'Recorte com zoom focalizado na área central da figura.'}
+                            </p>
+
+                            <div className="flex items-center gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => setEditingQuestion({ ...editingQuestion, figuraBase64: base64 })}
+                                className={`flex-1 py-1.5 px-2.5 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
+                                  isPrimary 
+                                    ? 'bg-indigo-600 text-white' 
+                                    : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                                }`}
+                              >
+                                {isPrimary ? 'Selecionada' : 'Selecionar'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDownloadPng(base64, `${editingQuestion.numero}_opcao_${cIdx + 1}`, editingQuestion.id)}
+                                disabled={downloadingPngId === editingQuestion.id}
+                                className="py-1.5 px-2 text-xs font-bold bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200/60 rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                                title="Baixar prévia desta opção em PNG"
+                              >
+                                <FileDown size={11} />
+                                <span>PNG</span>
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-400 italic">Nenhum recorte gerado para esta questão.</p>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-2.5 shrink-0">

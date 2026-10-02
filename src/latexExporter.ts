@@ -120,12 +120,17 @@ export function formatToLatex(text: string): string {
 }
 
 /**
- * Limpa o texto da alternativa para não repetir "A)", "B)", etc.,
- * já que o ambiente \begin{alternativas} gera os itens automaticamente.
+ * Limpa o texto da alternativa para não repetir "A)", "(A)", "[A]", "A.", etc.,
+ * já que o ambiente \begin{alternativas} gera as letras automaticamente.
  */
 export function formatAlternativaTexto(texto: string): string {
   if (!texto) return '';
-  const limpo = texto.replace(/^[A-Ea-e][\)\.\:\-]\s*/, '').trim();
+  const limpo = texto
+    .replace(/^(?:\(?[A-Ea-e]\)?\s*[\)\.\:\-–—\]]*|[A-Ea-e]\s*[\)\.\:\-–—\]])\s*/i, '')
+    .replace(/-\s*\n\s*/g, '')
+    .replace(/\n+/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
   return formatToLatex(limpo);
 }
 
